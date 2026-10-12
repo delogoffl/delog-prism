@@ -18,7 +18,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { serialise, comparable, matchesSaved } from '../lib/workspace.js'
+import { serialise, comparable, matchesSaved, parse } from '../lib/workspace.js'
 import { emptyCollection, emptyFlow, emptyRequest } from '../lib/collection.js'
 
 // Normalised on the way in. These files are CRLF, and a slice that searched
@@ -109,8 +109,9 @@ test('Ctrl+S saves and Ctrl+Shift+S saves as', () => {
 })
 
 test('the command palette lists saving, opening and reverting', () => {
-  for (const label of ['Save workspace', 'Save workspace as', 'Open a workspace']) {
-    assert.ok(app.includes(`label: '${label}'`), `the palette no longer offers "${label}"`)
+  const palette = app.slice(app.indexOf('function openPalette('), app.indexOf('\n}', app.indexOf('function openPalette(')))
+  for (const label of ['Save workspace', 'Save workspace as', 'Open a workspace', 'Discard changes and reload']) {
+    assert.ok(palette.includes(`cmd('${label}'`) || palette.includes(`label: '${label}'`), `the palette no longer offers "${label}"`)
   }
 })
 
@@ -191,10 +192,12 @@ test('the main process only writes where the user pointed a dialog', () => {
 
 test('only a real dialog, or this process’s own record of one, widens that set', () => {
   // The rule, rather than a count: a path may enter `chosenPaths` when the
-  // user drove a dialog (file:open, workspace:saveAs) or when the main process
-  // reads back the path it wrote down after one (workspace:restore). What must
-  // never widen it is anything taking a path from the renderer.
-  const allowed = ["ipcMain.handle('file:open'", "ipcMain.handle('workspace:saveAs'", "ipcMain.handle('workspace:restore'"]
+  // user drove a workspace dialog (workspace:open, workspace:saveAs) or when
+  // the main process reads back the path it wrote down after one
+  // (workspace:restore). What must never widen it is anything taking a path
+  // from the renderer -- or the generic file:open used by Import, which is how
+  // an imported Postman collection came to be overwritten by Save.
+  const allowed = ["ipcMain.handle('workspace:open'", "ipcMain.handle('workspace:saveAs'", "ipcMain.handle('workspace:restore'"]
   const bounds = allowed
     .map((needle) => {
       const at = main.indexOf(needle)
@@ -487,4 +490,125 @@ test('the caution mark is amber, since nothing is being destroyed', () => {
 test('the app sets a window icon', () => {
   assert.match(main, /function appIcon\(\)/, 'no runtime window icon — a dev run shows Electron’s own logo')
   assert.match(bodyOf(main, 'function createWindow()'), /\.\.\.\(icon \? \{ icon \} : \{\}\)/)
+})
+
+/* ------------------------------------------- what a save actually keeps */
+
+const roundTrip = (state) => {
+  const back = parse(JSON.stringify(serialise(state, { name: 'W' })))
+  assert.equal(back.ok, true, back.error)
+  return back.workspace
+}
+
+test('headers and auth set on a collection or a flow survive a save', () => {
+  // These were never written, so a token set once on the collection -- the
+  // whole point of inheritance -- was gone after the first save.
+  const state = someState()
+  const col = state.collections[0]
+  col.headers = [{ id: 'r1', key: 'X-Api-Version', value: '2', on: true }]
+  col.auth = { kind: 'bearer', token: '{{auth_token}}' }
+  col.flows[0].headers = [{ id: 'r2', key: 'X-Tenant', value: 'acme', on: false }]
+  col.flows[0].auth = { kind: 'basic', username: 'u', password: 'p' }
+
+  const back = roundTrip(state).collections[0]
+  assert.deepEqual(back.headers.map(({ key, value, on }) => ({ key, value, on })), [{ key: 'X-Api-Version', value: '2', on: true }])
+  assert.deepEqual(back.auth, { kind: 'bearer', token: '{{auth_token}}' })
+  assert.deepEqual(back.flows[0].headers.map(({ key, on }) => ({ key, on })), [{ key: 'X-Tenant', on: false }])
+  assert.equal(back.flows[0].auth.kind, 'basic')
+})
+
+test('GraphQL variables survive a save', () => {
+  const state = someState()
+  state.collections[0].flows[0].requests[0].gqlVariables = '{ "id": 7 }'
+  assert.equal(roundTrip(state).collections[0].flows[0].requests[0].gqlVariables, '{ "id": 7 }')
+})
+
+test('hand-placed nodes are remembered as hand-placed', () => {
+  // Positions were saved but which ones were dragged was not, so the
+  // auto-stacker re-flowed every column on the next start.
+  const state = someState()
+  const id = state.collections[0].flows[0].requests[0].id
+  state.layout.set(id, { x: 400, y: 900 })
+  state.moved = new Set([id, 'gone'])
+  const back = roundTrip(state)
+  assert.deepEqual([...back.moved], [id], 'only ids that still have a position are kept')
+  assert.deepEqual(back.layout.get(id), { x: 400, y: 900 })
+})
+
+test('run history survives a save and comes back on open', () => {
+  const state = someState()
+  state.history = [{ requestId: 'r', name: 'Log in', method: 'POST', status: 200, ms: 12, at: 5, env: 'Dev', failed: 0 }]
+  assert.equal(roundTrip(state).history.length, 1)
+  assert.match(bodyOf(app, 'function adopt('), /S\.history = workspace\.history/, 'adopt() must not throw the saved history away')
+})
+
+test('a file re-serialises to the same fingerprint it was written with', () => {
+  const state = someState()
+  state.collections[0].auth = { kind: 'bearer', token: 'x' }
+  const doc = serialise(state, { name: 'W' })
+  const reread = parse(JSON.stringify(doc)).workspace
+  assert.equal(comparable(serialise(reread, { name: reread.name })), comparable(doc))
+})
+
+/* ---------------------------------------- import never becomes the document */
+
+test('Import reads a file without making it the open document', () => {
+  const body = handlerOf(main, 'file:open')
+  assert.doesNotMatch(body, /rememberFile\(|chosenPaths\.add\(/, 'an imported file must never become a Save target')
+  assert.match(bodyOf(app, 'async function openWorkspace()'), /workspace\.open\(\)/, 'Open must use the workspace-only dialog')
+})
+
+test('only a real workspace can be remembered or handed back', () => {
+  assert.match(handlerOf(main, 'workspace:open'), /isWorkspaceText\(text\)/)
+  assert.match(bodyOf(main, 'function lastFile('), /isWorkspaceText\(/, 'a remembered non-workspace from an older build must be dropped')
+})
+
+/* ----------------------------------------------- unsaved is derived, not kept */
+
+test('unsaved state is compared, not flagged by hand', () => {
+  const body = bodyOf(app, 'function syncState(')
+  assert.match(body, /S\.fileDirty = Boolean\(S\.filePath\) && comparable\(doc\) !== written\.file/)
+  assert.match(body, /S\.dirty = autoKey\(doc\) !== written\.auto/)
+})
+
+test('every field edit anywhere is noticed', () => {
+  assert.match(bodyOf(app, 'function watchEdits('), /'input', 'change'/)
+  assert.match(bodyOf(app, 'async function boot()'), /watchEdits\(\)/)
+})
+
+test('dragging a node and sending a request both schedule a save', () => {
+  const drag = app.slice(app.indexOf('S.moved.add(req.id)'), app.indexOf('S.moved.add(req.id)') + 200)
+  assert.match(drag, /touch\(\)/)
+  assert.match(bodyOf(app, 'function remember('), /touch\(\)/)
+})
+
+test('an autosave records what it sent, not what is on screen when it returns', () => {
+  const body = bodyOf(app, 'async function autosave(')
+  assert.match(body, /written\.auto = autoKey\(doc\)/)
+})
+
+/* ------------------------------------------------- every route out is covered */
+
+test('the OS close is held until the page has saved', () => {
+  assert.match(main, /win\.on\('close', \(e\) => \{[\s\S]*?e\.preventDefault\(\)[\s\S]*?window:closeRequested/)
+  assert.match(main, /ipcMain\.handle\('window:closeNow'/)
+  assert.match(preload, /onCloseRequested: \(/)
+  assert.match(app, /window\.prism\.window\.onCloseRequested\(/)
+})
+
+/* ------------------------------------------- an empty workspace stays empty */
+
+test('an empty saved workspace restores as empty, not as a demo', () => {
+  // Deleting the last collection, saving and reopening used to bring a demo
+  // back in its place, because an empty workspace was read as "nothing saved".
+  const body = bodyOf(app, 'async function restoreWorkspace()')
+  assert.doesNotMatch(body, /countIn\(/, 'restore must not reject a workspace for having no requests')
+  assert.doesNotMatch(app, /demoWorkspace|from '\.\/demo\.js'/, 'there is no demo to fall back to')
+})
+
+test('Prism takes in no recordings', () => {
+  for (const marker of ['paintIntake', 'S.recorded', 'req.recorded', "'rebind-workspace'"]) {
+    assert.ok(!app.includes(marker), `${marker} is still in the renderer`)
+  }
+  assert.doesNotMatch(html, /id="intake"/)
 })

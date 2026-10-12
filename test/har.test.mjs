@@ -80,7 +80,7 @@ test('the same call forty times is one request', () => {
   const many = Array.from({ length: 40 }, () => entry())
   const r = fromHar(har(many))
   assert.equal(r.kept, 1)
-  assert.equal(r.flows[0].requests[0].recorded.times, 40, 'and it remembers how many')
+  assert.equal(r.flows[0].requests.length, 1)
 })
 
 test('a different query string is still the same request', () => {
@@ -101,7 +101,10 @@ test('the one that worked wins over the 401 that came first', () => {
     entry({ response: { status: 401, content: { mimeType: 'application/json', text: '{"error":"no"}' } } }),
     entry({ response: { status: 200, content: { mimeType: 'application/json', text: '{"id":7}' } } })
   ]))
-  assert.equal(r.flows[0].requests[0].recorded.status, 200)
+  // The kept call's proposed assertion is the one it passed with.
+  const status = r.flows[0].requests[0].assertions.find((a) => a.subject === 'status')
+  assert.equal(status.value, '200')
+  assert.equal('recorded' in r.flows[0].requests[0], false, 'an import is a request, not a recording')
 })
 
 /* ------------------------------------------------------------ the rewrite */

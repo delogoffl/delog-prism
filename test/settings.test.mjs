@@ -246,3 +246,21 @@ test('every settings group has an icon and a blurb', () => {
     assert.ok(blurb.length > 20, `${group}'s blurb is too short to say anything`)
   }
 })
+
+test('text settings survive a restart', async () => {
+  const { load, save } = await import('../lib/settings.js')
+  const store = new Map()
+  const storage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) }
+  save(storage, { proxy: 'http://proxy.local:3128', clientCert: 'C:/certs/me.pem' })
+  const back = load(storage)
+  assert.equal(back.proxy, 'http://proxy.local:3128')
+  assert.equal(back.clientCert, 'C:/certs/me.pem')
+})
+
+test('a secret setting is never written to storage', async () => {
+  const { save, SETTINGS } = await import('../lib/settings.js')
+  const secret = SETTINGS.find((s) => s.kind === 'secret')
+  const store = new Map()
+  save({ getItem: () => null, setItem: (k, v) => store.set(k, v) }, { [secret.id]: 'hunter2' })
+  assert.doesNotMatch([...store.values()].join(''), /hunter2/)
+})

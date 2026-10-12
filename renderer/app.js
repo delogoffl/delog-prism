@@ -1,5 +1,5 @@
 /**
- * Rebind Prism — the workspace.
+ * Prism — the workspace.
  *
  * THE IDEA
  *
@@ -19,8 +19,8 @@
  *
  * THREE LEVELS
  *
- * Collection → flow → request, which is what a Postman file and a Rebind
- * export both actually are. Flattening that lost where a flow came from and
+ * Collection → flow → request, which is what a Postman file and an OpenAPI
+ * document both actually are. Flattening that lost where a flow came from and
  * made a re-export produce a file shaped differently from the one opened.
  */
 import {
@@ -39,7 +39,7 @@ import { analyse, bytes as fmtBytes } from '../lib/insights.js'
 import { tree, diff, diffSummary } from '../lib/schema.js'
 import { TARGETS, GROUPS, WHOLE_FLOW, generate, slug } from '../lib/codegen.js'
 import { SETTINGS, GROUPS as SET_GROUPS, load as loadSettings, save as saveSettings, themeAttribute } from '../lib/settings.js'
-import { serialise, parse as parseWorkspace, countIn, missingSecrets, matchesSaved } from '../lib/workspace.js'
+import { serialise, parse as parseWorkspace, countIn, missingSecrets, matchesSaved, comparable } from '../lib/workspace.js'
 import { plan, describe as describePlan, outOfOrder } from '../lib/plan.js'
 import { fromCurl } from '../lib/curl.js'
 import { lines as jsonLines, suggestName, capturable } from '../lib/jsonlines.js'
@@ -50,7 +50,6 @@ import { summarise, flaky as flakyRuns, spark, headline, repeatVerdict } from '.
 import { readDataset, scopeFor, labelFor, unusedColumns } from '../lib/dataset.js'
 import { parseDotEnv, audit as auditEnv, looksSecret, copyName, freeName, renameKey, compare as compareEnvs } from '../lib/env.js'
 import { DYNAMIC, DYNAMIC_HELP } from '../lib/request.js'
-import { demoWorkspace } from './demo.js'
 
 /* ============================================================== plumbing */
 
@@ -77,6 +76,10 @@ const I = {
   play: '<path d="M7 4v16l13-8z" fill="currentColor" stroke="none"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   check: '<path d="m4 12 5.5 5.5L20 7"/>',
+  dots: '<circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/>',
+  home: '<path d="M4 11 12 4l8 7"/><path d="M6 9.5V20h12V9.5"/><path d="M10 20v-5h4v5"/>',
+  bolt: '<path d="M13 3 5 14h6l-1 7 8-11h-6z"/>',
+  terminal: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/>',
   alert: '<path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17h.01"/>',
   paste: '<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3h6v1"/><path d="M9 11h6M9 15h4"/>',
@@ -91,6 +94,7 @@ const I = {
   pencil: '<path d="M4 20h4l10-10a2.8 2.8 0 0 0-4-4L4 16z"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   up: '<path d="M12 14V4"/><path d="m8 8 4-4 4 4"/><path d="M4 20h16"/>',
+  import: '<path d="M12 4v10"/><path d="m8 10 4 4 4-4"/><path d="M4 20h16"/>',
   eye: '<path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/>',
   snow: '<path d="M12 3v18M4.5 7.5l15 9M19.5 7.5l-15 9"/>',
   table: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M9 10v9"/>',
@@ -116,7 +120,6 @@ function toast(kind, text) {
 
 const S = {
   collections: [],
-  recorded: [],
   environments: [],
   envId: '',
   pickedId: '',
@@ -173,7 +176,14 @@ function commit(what = 'all') {
   if (what === 'all' || what === 'bench') paintBench()
   if (what === 'all') paintBar()
   drawBeams()
+  // A sheet that edits the workspace -- a collection's auth and headers --
+  // is not part of any of the above, and used to sit there showing the old
+  // state: pick Bearer, and no token field appeared until it was reopened.
+  sheetRepaint?.()
 }
+
+/** Set while a sheet that shows editable workspace state is open. */
+let sheetRepaint = null
 
 /* ================================================================= theme */
 
@@ -216,22 +226,64 @@ function safeStorage() {
    restored on the next start. Save and Open write a file people can commit. */
 
 let saveTimer = 0
+let checkTimer = 0
 let booting = true
 
-/** Marks the workspace changed and schedules a save. */
+/**
+ * Fingerprints of what was last written, one per destination.
+ *
+ * Whether something is unsaved is *derived* by comparing what is on screen
+ * against these, never tracked by hand. Tracking by hand is what broke Save:
+ * every handler had to remember to call touch(), dozens did not (assertion
+ * fields, capture paths, dragging a node), and the ones that did fired on
+ * Open and Revert too, so a file was flagged unsaved the moment it opened.
+ */
+const written = { auto: '', file: '' }
+
+/** The autosave's fingerprint: everything it stores except the timestamp. */
+const autoKey = (doc) => JSON.stringify({ ...doc, savedAt: '' })
+
+/** Marks the workspace possibly changed; the comparison decides whether it is. */
 function touch() {
   if (booting) return
-  S.dirty = true
-  // Tracked separately from `dirty`, which the autosave clears. A change is
-  // still unsaved *as far as the file is concerned* until someone writes it,
-  // and conflating the two is how an indicator comes to read "everything
-  // saved" over a file twenty edits behind.
-  if (S.filePath) S.fileDirty = true
+  clearTimeout(checkTimer)
+  // Debounced lightly: a comparison per keystroke is wasted work, and a
+  // close in the meantime runs syncState() itself before deciding anything.
+  checkTimer = setTimeout(syncState, 150)
+}
+
+/**
+ * Works out what is unsaved, repaints the indicator, and schedules the autosave.
+ *
+ * `fileDirty` is "the file on disk is behind the screen" -- so editing a value
+ * and typing it back clears it, which no flag-based scheme could.
+ */
+function syncState() {
+  clearTimeout(checkTimer)
+  const doc = serialise(S, { name: S.savedName })
+  S.dirty = autoKey(doc) !== written.auto
+  S.fileDirty = Boolean(S.filePath) && comparable(doc) !== written.file
   paintSaveState()
   clearTimeout(saveTimer)
-  // Debounced: typing in a URL should not write a file per keystroke, and
-  // three seconds of quiet is a natural pause.
-  saveTimer = setTimeout(autosave, 3000)
+  if (S.dirty && S.prefs.autosave !== false) saveTimer = setTimeout(autosave, 1200)
+}
+
+/** Records that the open file now holds exactly what is on screen. */
+function markFileWritten(doc = serialise(S, { name: S.savedName })) {
+  written.file = comparable(doc)
+  S.fileDirty = false
+}
+
+/**
+ * Catches every edit, however it was made.
+ *
+ * Any field anywhere in the app that changes counts, so a panel added later
+ * cannot forget to report its edits the way the assertion and capture fields
+ * did. The comparison then throws away anything that was not a real change,
+ * like typing in a search box.
+ */
+function watchEdits() {
+  for (const kind of ['input', 'change']) document.addEventListener(kind, touch, true)
 }
 
 /**
@@ -249,10 +301,15 @@ function touch() {
  */
 async function autosave({ force = false } = {}) {
   if ((!S.dirty && !force) || S.prefs.autosave === false) return
-  const out = await window.prism.workspace.autosave(workspaceText())
+  clearTimeout(saveTimer)
+  // The fingerprint is taken from the document actually sent, not from the
+  // state after the write returns. Clearing a flag on return was how an edit
+  // made *during* the write was marked saved and then never written.
+  const doc = serialise(S, { name: S.savedName })
+  const out = await window.prism.workspace.autosave(JSON.stringify(doc, null, 2))
   if (out?.ok) {
-    S.dirty = false
-    paintSaveState()
+    written.auto = autoKey(doc)
+    syncState()
   } else if (out?.error) {
     toast('bad', `Could not save: ${out.error}`)
   }
@@ -271,6 +328,9 @@ const fileLabel = (path) => String(path).replace(/\\/g, '/').split('/').pop() ||
 function saveState() {
   if (S.saving) return 'saving'
   if (S.filePath) return S.fileDirty ? 'unsaved' : 'saved'
+  // With "Remember my work" off nothing is kept for it, so claiming it is
+  // about to be would be a lie that costs somebody their work.
+  if (S.prefs.autosave === false) return S.dirty ? 'unsaved' : 'autosaved'
   return S.dirty ? 'pending' : 'autosaved'
 }
 
@@ -293,11 +353,26 @@ function paintSaveState() {
     dot.className = `save-state is-${state}`
     dot.title = {
       saved: `Saved to ${S.filePath}`,
-      unsaved: `Unsaved changes — ${S.filePath}`,
+      unsaved: S.filePath ? `Unsaved changes — ${S.filePath}` : 'Not kept — “Remember my work” is off. Save to a file to keep it.',
       saving: 'Saving…',
       pending: 'Kept in the app; saving shortly. Save to a file to keep a copy you can commit.',
       autosaved: 'Kept in the app between sessions. Save to a file to keep a copy you can commit.'
     }[state]
+  }
+
+  const status = $('statusSave')
+  if (status) {
+    const words = {
+      saved: `Saved · ${S.filePath ? fileLabel(S.filePath) : ''}`,
+      unsaved: S.filePath ? `Unsaved changes · ${fileLabel(S.filePath)}` : 'Not kept — Remember my work is off',
+      saving: 'Saving…',
+      pending: 'Saving to the app…',
+      autosaved: 'Kept in the app · not saved to a file'
+    }[state]
+    const mark = el('i', { class: 'status-dot' })
+    mark.classList.add(`is-${state}`)
+    status.replaceChildren(mark, el('span', { text: words }))
+    status.title = dot?.title ?? ''
   }
 
   if (label) {
@@ -323,21 +398,26 @@ function adopt(workspace, note) {
   S.environments = workspace.environments
   S.envId = workspace.envId
   S.layout = workspace.layout
+  // Hand-placed nodes stay where they were put. Left as the previous
+  // workspace's set, the auto-stacker re-flowed every column on open.
+  S.moved = new Set(workspace.moved ?? [])
   S.baselines = workspace.baselines
   S.savedName = workspace.name
   S.results.clear()
   S.previous.clear()
-  S.history = []
+  // The run history is saved with the workspace and has to come back with
+  // it; emptying it here is what made History and every trend start blank.
+  S.history = workspace.history ?? []
   S.pickedId = allRequests()[0]?.id ?? ''
   commit()
-  setTimeout(fit, 30)
+  setTimeout(focusFlow, 30)
 
   const gone = missingSecrets(workspace)
   if (gone.length) {
     // Said out loud rather than left to fail at send time: the values were
     // withheld on purpose and only the person opening the file can restore
     // them.
-    toast('bad', `${gone.length} secret${gone.length === 1 ? '' : 's'} need refilling: ${gone.slice(0, 3).join(', ')}`)
+    toast('bad', `${gone.length === 1 ? 'A secret needs' : `${gone.length} secrets need`} refilling: ${gone.slice(0, 3).join(', ')}`)
   }
   if (note) toast('ok', note)
 }
@@ -369,10 +449,10 @@ async function restoreWorkspace() {
     const back = await window.prism.workspace.reread(saved.filePath)
     if (!back?.text) return false
     const fromFile = parseWorkspace(back.text, back.name)
-    if (!fromFile.ok || !countIn(fromFile.workspace)) return false
+    if (!fromFile.ok) return false
     adopt(fromFile.workspace)
     S.filePath = saved.filePath
-    S.fileDirty = false
+    markFileWritten()
     S.dirty = false
     return true
   }
@@ -382,20 +462,19 @@ async function restoreWorkspace() {
     toast('bad', result.error)
     return false
   }
-  if (!countIn(result.workspace)) return false
   adopt(result.workspace)
 
   if (saved.filePath) {
     S.filePath = saved.filePath
-    // Compared rather than assumed. `serialise` is deterministic for a given
-    // state, so an identical string means the file genuinely holds this
-    // workspace and the dot can say "saved" truthfully.
+    // Compared rather than assumed, on the authored content only. A straight
+    // text comparison can never match: `serialise` stamps a fresh `savedAt`
+    // every call, so a workspace restored moments after being saved came back
+    // flagged as having unsaved changes.
     const onDisk = await window.prism.workspace.reread(saved.filePath)
-    // Compared on the authored content only. A straight text comparison can
-    // never match: `serialise` stamps a fresh `savedAt` every call, so a
-    // workspace restored moments after being saved came back flagged as
-    // having unsaved changes.
-    S.fileDirty = !onDisk?.text || !matchesSaved(onDisk.text, serialise(S, { name: S.savedName }))
+    const current = serialise(S, { name: S.savedName })
+    if (onDisk?.text && matchesSaved(onDisk.text, current)) markFileWritten(current)
+    else written.file = fileKey(onDisk?.text)
+    S.fileDirty = comparable(current) !== written.file
     if (S.fileDirty) {
       toast('hold', `${fileLabel(saved.filePath)} has unsaved changes from last time — Ctrl+S writes them`)
     }
@@ -403,25 +482,41 @@ async function restoreWorkspace() {
   return true
 }
 
+/**
+ * The fingerprint of a file's content, read the way Prism would hold it.
+ *
+ * Re-serialised rather than taken raw, so a file written by an older build --
+ * missing a field this one writes, or with keys in another order -- is not
+ * reported as different from the identical workspace on screen.
+ */
+function fileKey(text) {
+  const result = parseWorkspace(text ?? '')
+  if (!result.ok) return ''
+  return comparable(serialise(result.workspace, { name: result.workspace.name }))
+}
+
 async function openWorkspace() {
   if (!(await keepOrDiscard('Opening another workspace'))) return
-  const chosen = await window.prism.file.open([
-    { name: 'Prism workspace', extensions: ['json'] },
-    { name: 'All files', extensions: ['*'] }
-  ])
+  const chosen = await window.prism.workspace.open()
   if (!chosen) return
+  if (chosen.error) {
+    toast('bad', chosen.error)
+    return
+  }
   const result = parseWorkspace(chosen.text, chosen.name)
   if (!result.ok) {
     toast('bad', result.error)
     return
   }
   adopt(result.workspace, `Opened ${result.workspace.name} — ${countIn(result.workspace)} requests`)
-  // Remembered, so Save writes back here rather than asking again. This is the
-  // whole reason `file:open` hands back a path.
+  // Remembered, so Save writes back here rather than asking again. The main
+  // process only vouches for a path it has checked is a workspace.
   S.filePath = chosen.path ?? ''
-  S.fileDirty = false
-  touch()
-  paintSaveState()
+  markFileWritten(serialise(result.workspace, { name: result.workspace.name }))
+  // The opened workspace replaces the autosave too, or the next start would
+  // bring back whatever was open before it.
+  await autosave({ force: true })
+  syncState()
 }
 
 /** The workspace as it would be written. */
@@ -437,17 +532,25 @@ const workspaceText = () => JSON.stringify(serialise(S, { name: S.savedName }), 
  */
 async function saveWorkspace() {
   if (!S.filePath) return saveWorkspaceAs()
+  if (S.saving) return false
   S.saving = true
   paintSaveState()
-  const out = await window.prism.workspace.write({ path: S.filePath, text: workspaceText() })
+  // The document is fixed before the write, so an edit made while the write
+  // is in flight is still reported as unsaved afterwards.
+  const doc = serialise(S, { name: S.savedName })
+  let out
+  try {
+    out = await window.prism.workspace.write({ path: S.filePath, text: JSON.stringify(doc, null, 2) })
+  } catch (err) {
+    out = { error: String(err?.message ?? err) }
+  }
   S.saving = false
   if (out?.ok) {
-    S.fileDirty = false
+    markFileWritten(doc)
     // Forced, so the app's own copy cannot be left older than the file it was
     // just written to. See the note on `autosave`.
     await autosave({ force: true })
-    S.dirty = false
-    paintSaveState()
+    syncState()
     toast('ok', `Saved ${fileLabel(S.filePath)}`)
     return true
   }
@@ -458,9 +561,16 @@ async function saveWorkspace() {
 }
 
 async function saveWorkspaceAs() {
+  if (S.saving) return false
   S.saving = true
   paintSaveState()
-  const out = await window.prism.workspace.saveAs({ name: slug(S.savedName), text: workspaceText() })
+  const doc = serialise(S, { name: S.savedName })
+  let out
+  try {
+    out = await window.prism.workspace.saveAs({ name: slug(S.savedName), text: JSON.stringify(doc, null, 2) })
+  } catch (err) {
+    out = { error: String(err?.message ?? err) }
+  }
   S.saving = false
   if (out?.error) {
     paintSaveState()
@@ -472,10 +582,9 @@ async function saveWorkspaceAs() {
     return false
   }
   S.filePath = out.path
-  S.fileDirty = false
+  markFileWritten(doc)
   await autosave({ force: true })
-  S.dirty = false
-  paintSaveState()
+  syncState()
   toast('ok', `Saved to ${out.path}`)
   return true
 }
@@ -486,6 +595,7 @@ async function revertWorkspace() {
   const yes = await ask({
     title: `Discard changes to ${fileLabel(S.filePath)}?`,
     blurb: 'Everything since the last save will be lost, and the file on disk reloaded in its place.',
+    note: 'This cannot be undone.',
     danger: 'Discard and reload'
   })
   if (!yes) return
@@ -502,8 +612,11 @@ async function revertWorkspace() {
   const path = S.filePath
   adopt(result.workspace, `Reloaded ${fileLabel(path)}`)
   S.filePath = path
-  S.fileDirty = false
-  paintSaveState()
+  markFileWritten()
+  // The discarded edits are discarded from the app's own copy as well, or
+  // they would come back on the next start.
+  await autosave({ force: true })
+  syncState()
 }
 
 /**
@@ -517,6 +630,9 @@ async function revertWorkspace() {
  * @returns {Promise<boolean>} whether the caller should proceed
  */
 function keepOrDiscard(what) {
+  // Decided on the current content, not on a debounced flag that may not
+  // have caught up with the last keystroke.
+  if (!booting) syncState()
   if (!S.filePath || !S.fileDirty) return Promise.resolve(true)
   return new Promise((resolve) => {
     let answered = false
@@ -587,6 +703,31 @@ async function revealWorkspace() {
   if (!shown) toast('bad', 'That file is no longer where it was saved')
 }
 
+/**
+ * The workspace switcher's menu: naming it, the document actions, and the
+ * pages that are about the workspace as a whole.
+ */
+function workspaceMenu() {
+  return [
+    { icon: I.home, label: 'Overview', run: () => openOverview() },
+    { icon: I.pencil, label: 'Rename workspace…', run: () => renameWorkspace() },
+    { sep: true },
+    ...saveMenu(),
+    { sep: true },
+    { icon: I.import, label: 'Import…', run: () => doImport() },
+    { icon: I.up, label: 'Export…', run: () => openExport() }
+  ]
+}
+
+/** The workspace's own name, which is what a saved file is called by default. */
+async function renameWorkspace() {
+  const name = await promptText({ title: 'Rename workspace', value: S.savedName || 'Workspace', action: 'Rename' })
+  if (!name) return
+  S.savedName = name
+  commit()
+  toast('ok', `Workspace renamed to ${name}`)
+}
+
 /** The Save button's menu — everything a document needs, in one place. */
 function saveMenu() {
   return [
@@ -624,11 +765,45 @@ function paintBar() {
     crumbs.append(el('span', { text: bit }))
   })
 
+  $('wsName').textContent = S.savedName || 'Workspace'
+
   const env = environment()
   $('envLabel').textContent = env ? env.name : 'No environment'
   $('envDot').className = `env-dot${env ? ' on' : ''}${env && /prod|live|release/i.test(env.name) ? ' risky' : ''}`
   $('runFlowBtn').disabled = !allFlows().some((f) => f.requests.length)
   $('exportBtn').disabled = !allRequests().length
+  paintStatus()
+}
+
+/** The status line: how much is here, and which environment it runs against. */
+function paintStatus() {
+  const n = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`
+  const counts = $('statusCounts')
+  if (counts) {
+    counts.textContent = `${n(S.collections.length, 'collection')} · ${n(allFlows().length, 'flow')} · ${n(allRequests().length, 'request')}`
+  }
+  const env = environment()
+  const where = $('statusEnv')
+  if (where) {
+    where.replaceChildren(el('i', { class: `status-dot${env ? ' is-saved' : ''}` }), el('span', { text: env ? env.name : 'No environment' }))
+  }
+}
+
+/**
+ * Shows or folds the collections sidebar. Remembered per machine, since it is
+ * a preference about the screen rather than part of the work.
+ */
+function setTreeShown(shown) {
+  $('stage').classList.toggle('tree-off', !shown)
+  paintRail()
+  try {
+    window.localStorage.setItem('prism.treeOff', shown ? '0' : '1')
+  } catch {
+    /* a preference that cannot be stored is still applied for this session */
+  }
+  // The plane changes width with the grid, and the wires are drawn against
+  // its box, so they are redrawn once the column has finished moving.
+  setTimeout(drawBeams, 240)
 }
 
 /* ================================================================== tree */
@@ -649,7 +824,7 @@ function paintTree() {
 
   if (!S.collections.length) {
     host.append(
-      el('p', { class: 'tree-nothing', html: 'No collections yet.<br />Import a Rebind recording or a Postman collection.' })
+      el('p', { class: 'tree-nothing', html: 'No collections yet.<br />Import a Postman collection or an OpenAPI document, or start a blank request.' })
     )
     return
   }
@@ -847,7 +1022,7 @@ function collectionMenu(col) {
     { label: 'Duplicate', icon: I.copy, run: () => duplicateCollection(col) },
     { sep: true },
     { label: 'Run every flow', icon: I.play, disabled: !requests.length, run: () => runCollection(col) },
-    { label: 'Export collection', icon: I.up, disabled: !requests.length, run: () => openExport(col.flows[0], null) },
+    { label: 'Export collection', icon: I.up, disabled: !requests.length, run: () => openExport(collectionAsFlow(col), null) },
     { sep: true },
     { label: 'Collapse all flows', icon: I.down, run: () => {
       for (const f of col.flows) f.open = false
@@ -884,7 +1059,7 @@ function requestMenu(req) {
     { label: 'Run it ten times', sub: 'looking for a flake', icon: I.play, run: () => repeatRequest(req, 10) },
     { label: S.baselines.has(req.id) ? 'Re-freeze baseline' : 'Freeze as baseline', icon: I.snow, disabled: !S.results.has(req.id), run: () => freezeBaseline(req) },
     { label: 'Copy as cURL', icon: I.copy, run: () => {
-      navigator.clipboard.writeText(generate('curl', { request: req, flow, environment: environment() }))
+      navigator.clipboard.writeText(generate('curl', { request: asSent(req), flow, environment: environment() }))
       toast('ok', 'cURL copied')
     } },
     { sep: true },
@@ -916,18 +1091,31 @@ function duplicateRequest(flow, req) {
   toast('ok', `Duplicated ${req.name}`)
 }
 
+/**
+ * What a collection or a flow hands down, copied deep. Without it a duplicate
+ * looked identical and sent every request without the inherited token.
+ */
+const levelCopy = (level) => ({
+  ...(level.headers ? { headers: structuredClone(level.headers) } : {}),
+  ...(level.auth ? { auth: structuredClone(level.auth) } : {}),
+  ...(level.description ? { description: level.description } : {})
+})
+
 function duplicateFlow(col, flow) {
-  const clone = emptyFlow(`${flow.name} copy`, flow.requests.map(copyRequest))
+  const clone = Object.assign(emptyFlow(`${flow.name} copy`, flow.requests.map(copyRequest)), levelCopy(flow))
   col.flows.splice(col.flows.indexOf(flow) + 1, 0, clone)
   commit()
   toast('ok', `Duplicated ${flow.name}`)
 }
 
 function duplicateCollection(col) {
-  const clone = emptyCollection(
-    `${col.name} copy`,
-    col.flows.map((f) => emptyFlow(f.name, f.requests.map(copyRequest))),
-    col.source
+  const clone = Object.assign(
+    emptyCollection(
+      `${col.name} copy`,
+      col.flows.map((f) => Object.assign(emptyFlow(f.name, f.requests.map(copyRequest)), levelCopy(f))),
+      col.source
+    ),
+    levelCopy(col)
   )
   S.collections.splice(S.collections.indexOf(col) + 1, 0, clone)
   commit()
@@ -997,7 +1185,7 @@ function closeMenu() {
   window.removeEventListener('keydown', menuKey)
 }
 
-const sourceTag = (s) => ({ postman: 'postman', 'rebind-workspace': 'rebind', 'rebind-suite': 'rebind' })[s] ?? s
+const sourceTag = (s) => ({ postman: 'postman', openapi: 'openapi', har: 'har' })[s] ?? s
 
 /* ------------------------------------------------------- add and delete */
 
@@ -1013,7 +1201,8 @@ function addRequest(flow) {
   flow.requests.push(req)
   S.pickedId = req.id
   commit()
-  setTimeout(fit, 20)
+  // Brought into view where it landed, rather than reframing everything.
+  setTimeout(() => reveal(req.id), 20)
 }
 
 function newCollection() {
@@ -1107,6 +1296,9 @@ function askDeleteCollection(col) {
 
 /** Everything held against a request id, so nothing is left behind. */
 function forget(id) {
+  // The baseline too: it is saved with the workspace, and one for a request
+  // that no longer exists stayed in every file written afterwards.
+  S.baselines.delete(id)
   S.layout.delete(id)
   S.moved.delete(id)
   S.results.delete(id)
@@ -1120,8 +1312,10 @@ function forget(id) {
 /** Space is a modifier for panning, read by both the plane and each node. */
 let spaceHeld = false
 
-const NODE_W = 268
-const COL_GAP = 360
+const NODE_W = 300
+/** Where the connection handles sit, from the top of a node: level with its header. */
+const HANDLE_Y = 26
+const COL_GAP = 390
 // Generous: a node with four ports is a good deal taller than one with none,
 // and nodes that overlap on first open make the graph look broken.
 const ROW_GAP = 208
@@ -1130,13 +1324,15 @@ function place() {
   let column = 0
   for (const flow of allFlows()) {
     flow.requests.forEach((req, i) => {
-      if (!S.layout.has(req.id)) S.layout.set(req.id, { x: 40 + column * COL_GAP, y: 40 + i * ROW_GAP })
+      // Room above the first node for the flow's lane header.
+      if (!S.layout.has(req.id)) S.layout.set(req.id, { x: 40 + column * COL_GAP, y: 96 + i * ROW_GAP })
     })
     if (flow.requests.length) column += 1
   }
 }
 
 function tidy() {
+  if (!allRequests().length) return
   S.layout.clear()
   S.moved.clear()
   place()
@@ -1151,8 +1347,19 @@ function paintPlane() {
   applyView()
   const list = allRequests()
   $('planeEmpty').hidden = list.length > 0
+  paintViewControls(list.length > 0)
   for (const req of list) host.append(nodeFor(req))
   restack()
+}
+
+/**
+ * Zoom, Fit and Tidy only mean something when there is something on the
+ * plane, so the toolbar is only there when there is. An empty plane shows the
+ * ways in and nothing else.
+ */
+function paintViewControls(any) {
+  document.querySelector('.plane-tools').hidden = !any
+  $('plane').classList.toggle('vacant', !any)
 }
 
 /**
@@ -1183,7 +1390,140 @@ function restack() {
       y = at.y + node.offsetHeight + GAP
     }
   }
+  paintLanes()
   drawBeams()
+}
+
+/**
+ * A lane behind each flow's nodes: its name, its size, how its last run
+ * went, and a way to run it.
+ *
+ * The flows were only ever implied by which column a node happened to be in;
+ * with nodes dragged around, nothing on the plane said which belonged to which.
+ * Drawn from where the nodes actually are, so it follows a drag.
+ */
+function paintLanes() {
+  const host = $('nodes')
+  for (const old of host.querySelectorAll('.lane')) old.remove()
+  const pad = 16
+  const head = 44
+  for (const flow of allFlows()) {
+    let box = null
+    for (const req of flow.requests) {
+      const at = S.layout.get(req.id)
+      const node = host.querySelector(`.node[data-id="${req.id}"]`)
+      if (!at || !node) continue
+      const r = { x1: at.x, y1: at.y, x2: at.x + NODE_W, y2: at.y + node.offsetHeight }
+      box = box ? { x1: Math.min(box.x1, r.x1), y1: Math.min(box.y1, r.y1), x2: Math.max(box.x2, r.x2), y2: Math.max(box.y2, r.y2) } : r
+    }
+    if (!box) continue
+    const ran = flow.requests.map((r) => S.results.get(r.id)).filter(Boolean)
+    const failing = ran.filter((r) => r.error || r.failed).length
+    const state = flow.requests.some((r) => S.busy.has(r.id)) ? 'busy' : !ran.length ? 'idle' : failing ? 'fail' : 'pass'
+    const lane = el(
+      'div',
+      {
+        class: 'lane',
+        'data-state': state,
+        style: `left:${box.x1 - pad}px;top:${box.y1 - head}px;width:${box.x2 - box.x1 + pad * 2}px;height:${box.y2 - box.y1 + head + pad}px`
+      },
+      [
+        el('div', { class: 'lane-head' }, [
+          el('span', { class: 'lane-dot' }),
+          el('b', { class: 'lane-name', text: flow.name || 'Untitled flow' }),
+          el('span', { class: 'lane-count', text: String(flow.requests.length) }),
+          el('span', { class: 'lane-gap' }),
+          ran.length
+            ? el('span', { class: 'lane-state', text: state === 'busy' ? 'Running…' : failing ? `${failing} failing` : `${ran.length}/${flow.requests.length} passed` })
+            : null,
+          el('button', {
+            class: 'lane-run',
+            type: 'button',
+            title: `Run ${flow.name}`,
+            html: `${ico(I.play, 9)}<span>Run</span>`,
+            onclick: (e) => {
+              e.stopPropagation()
+              runFlow(flow)
+            }
+          })
+        ])
+      ]
+    )
+    host.prepend(lane)
+  }
+}
+
+/**
+ * A map of the whole plane in the corner, with the part on screen outlined.
+ * Click or drag in it to go somewhere.
+ */
+function paintMinimap() {
+  const box = $('minimap')
+  if (!box) return
+  const list = allRequests().filter((r) => S.layout.has(r.id))
+  box.hidden = list.length < 2 || pageOpen !== ''
+  if (box.hidden) return
+
+  const plane = $('plane').getBoundingClientRect()
+  const { x, y, z } = S.view
+  const view = { x1: -x / z, y1: -y / z, x2: (plane.width - x) / z, y2: (plane.height - y) / z }
+  let w = { ...view }
+  const rects = []
+  for (const req of list) {
+    const at = S.layout.get(req.id)
+    const node = document.querySelector(`.node[data-id="${req.id}"]`)
+    const h = node ? node.offsetHeight : 140
+    rects.push({ req, x: at.x, y: at.y, h })
+    w = { x1: Math.min(w.x1, at.x), y1: Math.min(w.y1, at.y - 44), x2: Math.max(w.x2, at.x + NODE_W), y2: Math.max(w.y2, at.y + h) }
+  }
+
+  const W = 184
+  const H = 116
+  const inset = 8
+  const scale = Math.min((W - inset * 2) / (w.x2 - w.x1), (H - inset * 2) / (w.y2 - w.y1))
+  const ox = inset + (W - inset * 2 - (w.x2 - w.x1) * scale) / 2 - w.x1 * scale
+  const oy = inset + (H - inset * 2 - (w.y2 - w.y1) * scale) / 2 - w.y1 * scale
+  box._map = { scale, ox, oy }
+
+  const shapes = rects
+    .map(({ req, x: rx, y: ry, h }) => {
+      const res = S.results.get(req.id)
+      const tone = !res ? 'idle' : res.error || res.failed ? 'fail' : 'pass'
+      const on = req.id === S.pickedId ? ' on' : ''
+      return `<rect class="mm-node ${tone}${on}" x="${(ox + rx * scale).toFixed(1)}" y="${(oy + ry * scale).toFixed(1)}" width="${(NODE_W * scale).toFixed(1)}" height="${Math.max(3, h * scale).toFixed(1)}" rx="2"/>`
+    })
+    .join('')
+  const vp = `<rect class="mm-view" x="${(ox + view.x1 * scale).toFixed(1)}" y="${(oy + view.y1 * scale).toFixed(1)}" width="${((view.x2 - view.x1) * scale).toFixed(1)}" height="${((view.y2 - view.y1) * scale).toFixed(1)}" rx="4"/>`
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true">${shapes}${vp}</svg>`
+}
+
+/** Centres the plane on the point of the minimap under the pointer. */
+function wireMinimap() {
+  const box = $('minimap')
+  if (!box) return
+  const goTo = (e) => {
+    const map = box._map
+    if (!map) return
+    const r = box.getBoundingClientRect()
+    const wx = (e.clientX - r.left - map.ox) / map.scale
+    const wy = (e.clientY - r.top - map.oy) / map.scale
+    const plane = $('plane').getBoundingClientRect()
+    S.view.x = plane.width / 2 - wx * S.view.z
+    S.view.y = plane.height / 2 - wy * S.view.z
+    applyView()
+  }
+  box.addEventListener('pointerdown', (e) => {
+    e.stopPropagation()
+    e.preventDefault()
+    goTo(e)
+    const move = (ev) => goTo(ev)
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  })
 }
 
 /**
@@ -1198,32 +1538,59 @@ function nodeFor(req) {
   const res = S.results.get(req.id)
   const verb = req.method.toLowerCase()
   const known = envValues()
+  const needs = variablesUsed(req)
+  const gives = (req.captures ?? []).filter((c) => c.name).map((c) => c.name)
+  const n = (req.assertions ?? []).length
+
+  // The outcome, as one word the whole card can be tinted by.
+  const outcome = S.busy.has(req.id) ? 'busy' : !res ? 'idle' : res.error || res.failed ? 'fail' : res.status >= 400 ? 'warn' : 'pass'
 
   const node = el('div', {
     class: `node${req.id === S.pickedId ? ' on' : ''}${S.busy.has(req.id) ? ' busy' : ''}`,
     style: `left:${at.x}px;top:${at.y}px`,
     'data-id': req.id,
+    'data-outcome': outcome,
     tabindex: '0',
     role: 'button',
     'aria-label': `${req.method} ${req.name}`
   })
 
-  node.append(el('span', { class: `node-line ${verb}` }))
+  // Connection handles on the card's edges, where the wires attach: in on
+  // the left when it needs something, out on the right when it gives.
+  if (needs.length) node.append(el('span', { class: 'handle in' }))
+  if (gives.length) node.append(el('span', { class: 'handle out' }))
+
+  /* header — what it is, and how it went */
+  let status
+  if (S.busy.has(req.id)) status = el('span', { class: 'node-status busy', html: '<i></i>Running' })
+  else if (res) status = el('span', { class: `node-status ${outcome}`, html: `<i></i>${res.error ? 'Error' : esc(String(res.status))}` })
+  else status = el('span', { class: 'node-status idle', html: '<i></i>Not run' })
+
   node.append(
     el('div', { class: 'node-top' }, [
       el('span', { class: `verb ${verb}`, text: req.method }),
-      el('span', { class: 'node-name', text: req.name || 'Untitled' })
+      el('span', { class: 'node-name', text: req.name || 'Untitled' }),
+      status,
+      el('button', {
+        class: 'node-more',
+        type: 'button',
+        title: 'Actions',
+        'aria-label': `Actions for ${req.name}`,
+        html: ico(I.dots, 13, 2),
+        onclick: (e) => {
+          e.stopPropagation()
+          if (S.pickedId !== req.id) pick(req.id)
+          openMenu(pointAnchor(e.clientX, e.clientY), requestMenu(req))
+        }
+      })
     ])
   )
   node.append(el('span', { class: 'node-path', html: pathLabel(req.url) }))
-  node.append(specStrip(req))
 
   /* ports — what it needs on the left, what it gives on the right, on the
-     same sides the beams arrive and leave from. */
-  const needs = variablesUsed(req)
-  const gives = (req.captures ?? []).filter((c) => c.name).map((c) => c.name)
+     same sides the wires arrive and leave from. */
   if ((needs.length || gives.length) && S.prefs.showPorts !== false) {
-    const inCol = el('div', { class: 'port-col' })
+    const inCol = el('div', { class: 'port-col' }, [el('span', { class: 'port-head', text: needs.length ? 'Needs' : '' })])
     for (const name of needs.slice(0, 4)) {
       const from = allRequests().find((r) => (r.captures ?? []).some((c) => c.name === name))
       const met = Boolean(from) || Object.prototype.hasOwnProperty.call(known, name)
@@ -1235,39 +1602,32 @@ function nodeFor(req) {
         })
       )
     }
-    if (needs.length > 4) inCol.append(el('span', { class: 'port needs', text: `+${needs.length - 4} more` }))
+    if (needs.length > 4) inCol.append(el('span', { class: 'port more', text: `+${needs.length - 4} more` }))
 
-    const outCol = el('div', { class: 'port-col out' })
+    const outCol = el('div', { class: 'port-col out' }, [el('span', { class: 'port-head', text: gives.length ? 'Gives' : '' })])
     for (const name of gives.slice(0, 4)) {
       outCol.append(el('span', { class: 'port gives', html: `${esc(name)}<span class="port-dot"></span>` }))
     }
-    if (gives.length > 4) outCol.append(el('span', { class: 'port gives', text: `+${gives.length - 4}` }))
+    if (gives.length > 4) outCol.append(el('span', { class: 'port more', text: `+${gives.length - 4} more` }))
 
     node.append(el('div', { class: 'ports' }, [inCol, outCol]))
   }
 
+  /* footer — what goes out, and how long it took */
   const foot = el('div', { class: 'node-foot' })
-  const n = (req.assertions ?? []).length
-  if (res) {
-    foot.append(el('span', { class: `code ${tone(res.status)}`, text: res.error ? 'ERR' : String(res.status) }))
-    if (!res.error) {
-      foot.append(el('span', { text: `${res.timing?.total ?? 0}ms` }))
-      foot.append(el('span', { text: fmtBytes(res.bytes) }))
-    }
-    if (n) {
-      foot.append(
-        el('span', { class: `checks ${res.failed ? 'fail' : 'pass'}`, text: res.failed ? `${res.failed}/${n} failed` : `${n} passed` })
-      )
-    }
-  } else if (req.recorded) {
-    // Never run here, but it was recorded doing something — which is a far
-    // more useful thing to show than "no assertions".
-    foot.append(el('span', { class: `code ${tone(req.recorded.status)} ghost`, text: String(req.recorded.status) }))
-    foot.append(el('span', { text: `${req.recorded.durationMs}ms when recorded` }))
-  } else {
-    foot.append(el('span', { text: n ? `${n} assertion${n === 1 ? '' : 's'}` : 'no assertions' }))
-  }
+  foot.append(specStrip(req))
   foot.append(el('span', { class: 'spacer' }))
+  if (res && !res.error) foot.append(el('span', { class: 'node-ms', text: `${res.timing?.total ?? 0} ms` }))
+  if (n) {
+    const failed = res?.failed ?? 0
+    foot.append(
+      el('span', {
+        class: `checks${res ? (failed ? ' fail' : ' pass') : ''}`,
+        title: res ? `${n - failed} of ${n} assertions passed` : `${n} assertion${n === 1 ? '' : 's'}`,
+        html: `${ico(res && failed ? I.x : I.check, 10, 2.6)}${res ? `${n - failed}/${n}` : n}`
+      })
+    )
+  }
   foot.append(
     el('button', {
       class: 'node-run',
@@ -1289,7 +1649,17 @@ function nodeFor(req) {
       delete node.dataset.moved
       return
     }
-    if (!e.target.closest('button')) pick(req.id)
+    if (e.target.closest('button')) return
+    // Picking redraws the plane, so the node under the second click of a
+    // double-click is a new element and a `dblclick` never arrives. The click
+    // count does: two means open it for editing.
+    if (e.detail >= 2) {
+      if (S.pickedId !== req.id) pick(req.id)
+      $('urlInput')?.focus()
+      $('urlInput')?.select()
+      return
+    }
+    pick(req.id)
   })
   node.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -1322,12 +1692,12 @@ function specStrip(req) {
     chip('body', req.bodyKind, `${req.bodyKind} body, ${size} characters`)
   }
 
+  // Parameter and header counts used to ride here too, and crowded the
+  // footer until none of it was readable; the inspector's tabs carry them.
   const q = (req.query ?? []).filter((r) => r.on !== false && r.key).length
   const pp = (req.pathParams ?? []).filter((r) => r.on !== false && r.key).length
   const h = (req.headers ?? []).filter((r) => r.on !== false && r.key).length
-  if (q) chip('n', `${q} query`, `${q} query parameter${q === 1 ? '' : 's'}`)
-  if (pp) chip('n', `${pp} path`, `${pp} path parameter${pp === 1 ? '' : 's'}`)
-  if (h) chip('n', `${h} header${h === 1 ? '' : 's'}`, `${h} header${h === 1 ? '' : 's'}`)
+  strip.title = `${q} query · ${pp} path · ${h} header${h === 1 ? '' : 's'}`
 
   // The host only when it is a literal. When it comes from {{base_url}} the
   // environment decides, and printing the variable twice helps nobody.
@@ -1427,17 +1797,20 @@ function drawBeams() {
     </marker>`
   host.append(defs)
 
+  /** Label boxes already drawn this pass, so the next one can avoid them. */
+  const placed = []
   for (const beam of beams()) {
     const a = box(beam.from)
     const b = box(beam.to)
     if (!a || !b) continue
 
-    // Leaves the giver's right edge level with its ports and arrives at the
-    // taker's left edge level with its own, so a line lands where the name is.
-    const x1 = a.x + a.w
-    const y1 = a.y + a.h - 46 * z
-    const x2 = b.x
-    const y2 = b.y + Math.min(b.h - 40 * z, 74 * z)
+    // From the giver's out-handle to the taker's in-handle: both sit on the
+    // card edge level with the header, so every wire attaches somewhere
+    // visible rather than at an arbitrary point on a border.
+    const x1 = a.x + a.w + 5 * z
+    const y1 = a.y + HANDLE_Y * z
+    const x2 = b.x - 5 * z
+    const y2 = b.y + HANDLE_Y * z
     const bend = Math.max(44, Math.abs(x2 - x1) * 0.45)
 
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
@@ -1453,13 +1826,34 @@ function drawBeams() {
       // Three quarters of the way along rather than the middle. One request
       // often feeds four others, and every label at the midpoint piles up on
       // top of the source; near the target they spread out with the arrows.
+      //
+      // Two beams into the same node still land on the same spot, which is
+      // what printed "auth_token" over "user_id". So each label claims its
+      // box, a label that would overlap one already placed steps down a line,
+      // and one with nowhere to go is left off rather than drawn illegibly.
+      const size = 9.5 * Math.max(0.85, z)
+      const w = beam.name.length * size * 0.62
+      // Kept in the gap between the two nodes: further along, it slid under
+      // the target's edge and read as "efault_addr".
+      // A label wider than the gap is skipped rather than drawn half under a
+      // node; zooming in gives it room and it comes back.
+      if (x2 > x1 && x2 - x1 - 16 < w) continue
+      const x = x2 > x1 ? Math.max(x1 + 6 + w / 2, Math.min(x1 + (x2 - x1) * 0.72, x2 - 10 - w / 2)) : x1 + (x2 - x1) * 0.72
+      let y = y1 + (y2 - y1) * 0.86 - 6
+      const hits = (yy) => placed.some((p) => Math.abs(p.x - x) < (p.w + w) / 2 + 4 && Math.abs(p.y - yy) < size + 2)
+      let tries = 0
+      while (hits(y) && tries < 4) {
+        y += size + 3
+        tries += 1
+      }
+      if (hits(y)) continue
+      placed.push({ x, y, w })
       const t = document.createElementNS('http://www.w3.org/2000/svg', 'text')
-      t.setAttribute('x', String(x1 + (x2 - x1) * 0.72))
-      t.setAttribute('y', String(y1 + (y2 - y1) * 0.86 - 6))
+      t.setAttribute('x', String(x))
+      t.setAttribute('y', String(y))
       t.setAttribute('text-anchor', 'middle')
-      t.setAttribute('fill', 'var(--sx-tint)')
-      t.setAttribute('font-size', String(9.5 * Math.max(0.85, z)))
-      t.setAttribute('font-family', 'var(--mono)')
+      t.setAttribute('class', 'beam-label')
+      t.setAttribute('font-size', String(size))
       t.textContent = beam.name
       host.append(t)
     }
@@ -1489,6 +1883,7 @@ function drag(e, req, node) {
     at.y = Math.round(origin.y + dy)
     node.style.left = `${at.x}px`
     node.style.top = `${at.y}px`
+    paintLanes()
     drawBeams()
   }
   const up = () => {
@@ -1498,6 +1893,8 @@ function drag(e, req, node) {
     if (moved) {
       node.dataset.moved = '1'
       S.moved.add(req.id)
+      // An arrangement is work, and it is saved with the workspace.
+      touch()
     }
   }
   window.addEventListener('pointermove', move)
@@ -1543,6 +1940,8 @@ function wirePlane() {
   }
 
   plane.addEventListener('pointerdown', (e) => {
+    // An empty plane has nothing to move to; the welcome cards stay put.
+    if (!allRequests().length) return
     // Middle button, or space held: pans from anywhere, over a node included.
     if (e.button === 1 || (spaceHeld && e.button === 0)) {
       e.preventDefault()
@@ -1550,7 +1949,7 @@ function wirePlane() {
       return
     }
     if (e.button !== 0) return
-    if (e.target.closest('.node') || e.target.closest('.plane-tools') || e.target.closest('.intake') || e.target.closest('.legend')) return
+    if (e.target.closest('.node, .plane-tools, .legend, .minimap, .lane-run')) return
     beginPan(e)
   })
 
@@ -1563,24 +1962,34 @@ function wirePlane() {
     'wheel',
     (e) => {
       e.preventDefault()
+      if (!allRequests().length) return
+
+      const r = plane.getBoundingClientRect()
+      const px = e.clientX - r.left
+      const py = e.clientY - r.top
 
       // A trackpad pinch arrives as a wheel event with ctrlKey set, and
-      // ctrl-wheel on a mouse means the same thing everywhere else.
+      // ctrl-wheel means zoom everywhere. A pinch sends many small deltas, so
+      // the step follows the delta and the gesture tracks the fingers.
       if (e.ctrlKey || e.metaKey) {
-        const r = plane.getBoundingClientRect()
-        const px = e.clientX - r.left
-        const py = e.clientY - r.top
-        const next = clamp(S.view.z * (e.deltaY > 0 ? 0.93 : 1.07), 0.3, 2)
-        // Around the pointer, so whatever is under the cursor stays under it.
-        S.view.x = px - ((px - S.view.x) / S.view.z) * next
-        S.view.y = py - ((py - S.view.y) / S.view.z) * next
-        S.view.z = next
-        applyView()
+        const factor = isMouseWheel(e) ? (e.deltaY > 0 ? 1 / 1.12 : 1.12) : Math.exp(-e.deltaY * 0.01)
+        zoomAt(px, py, S.view.z * factor)
         return
       }
 
-      // Otherwise it is a scroll, and a scroll moves the plane. Shift swaps
-      // the axis for a wheel that only has one.
+      // A mouse wheel zooms around the pointer, as it does on every node
+      // canvas -- scrolling it used to slide the whole graph down the screen.
+      // Shift still pans sideways, and the setting puts panning back for
+      // anyone who prefers it.
+      if (isMouseWheel(e) && !e.shiftKey && S.prefs.wheel !== 'pan') {
+        const notches = Math.max(1, Math.round(Math.abs(e.wheelDeltaY || e.deltaY) / 120))
+        zoomAt(px, py, S.view.z * (e.deltaY > 0 ? 1 / 1.12 : 1.12) ** notches)
+        return
+      }
+
+      // A trackpad's two-finger scroll moves the plane, which is what the
+      // gesture means on any surface. Shift swaps the axis for a wheel that
+      // only has one.
       const [dx, dy] = e.shiftKey && !e.deltaX ? [e.deltaY, 0] : [e.deltaX, e.deltaY]
       S.view.x -= dx
       S.view.y -= dy
@@ -1588,6 +1997,38 @@ function wirePlane() {
     },
     { passive: false }
   )
+
+  // Ctrl with the wheel anywhere else would zoom the whole interface.
+  window.addEventListener(
+    'wheel',
+    (e) => {
+      if (e.ctrlKey) e.preventDefault()
+    },
+    { passive: false }
+  )
+
+  // Right-click: the request's own menu on a node, the plane's on empty space.
+  plane.addEventListener('contextmenu', (e) => {
+    if (e.target.closest('.plane-tools')) return
+    e.preventDefault()
+    const at = pointAnchor(e.clientX, e.clientY)
+    const node = e.target.closest('.node')
+    const req = node ? findRequest(node.dataset.id) : null
+    if (req) {
+      if (S.pickedId !== req.id) pick(req.id)
+      openMenu(at, requestMenu(req))
+      return
+    }
+    const r = plane.getBoundingClientRect()
+    openMenu(at, planeMenu(e.clientX - r.left, e.clientY - r.top))
+  })
+
+  // Double-click on empty plane frames everything, as the Fit button does.
+  // (A double-click on a node is handled by the node: see nodeFor.)
+  plane.addEventListener('dblclick', (e) => {
+    if (e.target.closest('.node, .plane-tools')) return
+    fit()
+  })
 
   // Space is a modifier here, not a button press, so it must not scroll the
   // page or activate whatever happens to be focused.
@@ -1609,16 +2050,159 @@ function wirePlane() {
     plane.classList.remove('ready')
   })
 
-  $('zoomIn').onclick = () => {
-    S.view.z = clamp(S.view.z * 1.15, 0.3, 2)
-    applyView()
-  }
-  $('zoomOut').onclick = () => {
-    S.view.z = clamp(S.view.z / 1.15, 0.3, 2)
-    applyView()
-  }
+  // Around the middle of the plane, not its corner: zooming from 0,0 threw
+  // whatever you were looking at off the screen.
+  $('zoomIn').onclick = () => zoomBy(1.2)
+  $('zoomOut').onclick = () => zoomBy(1 / 1.2)
+  $('zoomPct').onclick = () => zoomTo(1)
+  $('zoomPct').title = 'Reset to 100% (Ctrl 0)'
   $('zoomFit').onclick = fit
+  $('zoomFit').title = 'Fit everything on screen (Shift 1)'
   $('tidyBtn').onclick = tidy
+}
+
+const ZOOM_MIN = 0.25
+const ZOOM_MAX = 2.5
+
+/**
+ * Whether a wheel event came from a mouse wheel rather than a trackpad.
+ *
+ * A wheel moves in whole notches on one axis: Chromium reports each notch as
+ * 120 in the legacy `wheelDeltaY`, or in lines rather than pixels. A trackpad
+ * sends a stream of small pixel deltas, usually on both axes at once.
+ */
+function isMouseWheel(e) {
+  if (e.deltaMode !== 0) return true
+  if (e.deltaX !== 0) return false
+  if (e.wheelDeltaY) return e.wheelDeltaY % 120 === 0
+  return Math.abs(e.deltaY) >= 100
+}
+
+/** Zooms so the point under (px, py) on the plane stays where it is. */
+function zoomAt(px, py, next) {
+  // Every zoom comes through here — wheel, keys, menu, buttons — so an empty
+  // plane is refused once, in one place.
+  if (!allRequests().length) return
+  const z = clamp(next, ZOOM_MIN, ZOOM_MAX)
+  S.view.x = px - ((px - S.view.x) / S.view.z) * z
+  S.view.y = py - ((py - S.view.y) / S.view.z) * z
+  S.view.z = z
+  applyView()
+}
+
+/** Zooms around the centre of the plane, for buttons and keys. */
+function zoomBy(factor) {
+  const r = $('plane').getBoundingClientRect()
+  zoomAt(r.width / 2, r.height / 2, S.view.z * factor)
+}
+
+function zoomTo(z) {
+  const r = $('plane').getBoundingClientRect()
+  zoomAt(r.width / 2, r.height / 2, z)
+}
+
+/** Something openMenu can position against: a point rather than a button. */
+const pointAnchor = (x, y) => ({ getBoundingClientRect: () => ({ left: x, right: x, top: y, bottom: y, width: 0, height: 0 }) })
+
+/** The flow new requests go into: the picked request's, or the first one. */
+const workingFlow = () => (S.pickedId ? flowOf(S.pickedId) : null) ?? allFlows()[0] ?? null
+
+/** Right-click on empty plane. */
+function planeMenu(px, py) {
+  const flow = workingFlow()
+  const any = allRequests().length > 0
+  return [
+    {
+      icon: I.plus,
+      label: flow ? `New request in ${flow.name}` : 'New request',
+      keys: 'Ctrl+N',
+      disabled: !flow,
+      run: () => {
+        addRequest(flow)
+        // Placed where the click was, rather than at the bottom of a column.
+        const at = S.layout.get(S.pickedId)
+        if (at) {
+          at.x = Math.round((px - S.view.x) / S.view.z)
+          at.y = Math.round((py - S.view.y) / S.view.z)
+          S.moved.add(S.pickedId)
+          commit('plane')
+        }
+      }
+    },
+    { icon: I.play, label: flow ? `Run ${flow.name}` : 'Run flow', disabled: !flow?.requests.length, run: () => runFlow(flow) },
+    // The view entries only exist when there is something to view.
+    ...(any
+      ? [
+          { sep: true },
+          { icon: I.plus, label: 'Zoom in', keys: 'Ctrl+=', run: () => zoomAt(px, py, S.view.z * 1.2) },
+          { icon: I.x, label: 'Zoom out', keys: 'Ctrl+-', run: () => zoomAt(px, py, S.view.z / 1.2) },
+          { icon: I.eye, label: 'Zoom to 100%', keys: 'Ctrl+0', run: () => zoomTo(1) },
+          { icon: I.eye, label: 'Fit everything', keys: 'Shift+1', run: fit },
+          { icon: I.revert, label: 'Tidy the layout', run: tidy }
+        ]
+      : [])
+  ]
+}
+
+/**
+ * The plane's keyboard: the shortcuts every canvas tool has.
+ *
+ * Only when nothing is being typed into and no sheet is open, so Delete in a
+ * header field deletes a character, not the request.
+ *
+ * @returns {boolean} whether the key was handled
+ */
+function planeKey(e) {
+  if (sheetUp || pageOpen || isTyping(e.target) || document.querySelector('.menu')) return false
+  const mod = e.ctrlKey || e.metaKey
+  const req = current()
+  const key = e.key
+  // Arrows and Delete belong to whatever has focus; they act on the graph
+  // only when that is the graph, the tree, or nothing in particular.
+  const onGraph = e.target === document.body || Boolean(e.target.closest?.('.plane, .tree, .rail'))
+
+  if (mod && (key === '=' || key === '+')) zoomBy(1.2)
+  else if (mod && (key === '-' || key === '_')) zoomBy(1 / 1.2)
+  else if (mod && key === '0') zoomTo(1)
+  else if (!mod && e.shiftKey && (key === '!' || e.code === 'Digit1')) fit()
+  else if (mod && key.toLowerCase() === 'd' && req) duplicateRequest(flowOf(req.id), req)
+  else if (mod && key.toLowerCase() === 'n' && !e.shiftKey) {
+    const flow = workingFlow()
+    if (!flow) return false
+    addRequest(flow)
+  } else if (!mod && onGraph && (key === 'Delete' || key === 'Backspace') && req) askDeleteRequest(req)
+  else if (!mod && onGraph && !e.altKey && (key === 'ArrowDown' || key === 'ArrowUp')) {
+    // Steps through the requests in the order the tree lists them, and
+    // brings the one picked into view if it is off the screen.
+    const list = allRequests()
+    if (!list.length) return false
+    const at = list.findIndex((r) => r.id === S.pickedId)
+    const next = list[clamp(at + (key === 'ArrowDown' ? 1 : -1), 0, list.length - 1)] ?? list[0]
+    pick(next.id)
+    reveal(next.id)
+  } else return false
+
+  e.preventDefault()
+  return true
+}
+
+/** Pans just enough to bring a node fully into view. */
+function reveal(id) {
+  const at = S.layout.get(id)
+  const node = document.querySelector(`.node[data-id="${id}"]`)
+  if (!at || !node) return
+  const r = $('plane').getBoundingClientRect()
+  const { z } = S.view
+  const pad = 40
+  const left = at.x * z + S.view.x
+  const top = at.y * z + S.view.y
+  const w = NODE_W * z
+  const h = node.offsetHeight * z
+  if (left < pad) S.view.x += pad - left
+  else if (left + w > r.width - pad) S.view.x -= left + w - (r.width - pad)
+  if (top < pad) S.view.y += pad - top
+  else if (top + h > r.height - pad - 60) S.view.y -= top + h - (r.height - pad - 60)
+  applyView()
 }
 
 /** True while the caret is in something the user is writing into. */
@@ -1634,12 +2218,34 @@ function applyView() {
   $('planeDots').style.backgroundSize = `${24 * z}px ${24 * z}px`
   $('zoomPct').textContent = `${Math.round(z * 100)}%`
   drawBeams()
+  paintMinimap()
 }
 
+/** Frames everything on the plane. */
 function fit() {
-  const list = allRequests()
+  frame(allRequests(), { most: 1.1 })
+}
+
+/**
+ * Frames the flow being worked on, at a size its nodes can be read at.
+ *
+ * Fitting everything is honest but, beside the sidebar and the inspector,
+ * three flows come out at under half size: tiny text on first open. The
+ * flow you are in, readable, with its neighbours at the edges, is the better
+ * first view; Fit and the minimap are there for the whole picture.
+ */
+function focusFlow() {
+  const flow = (S.pickedId ? flowOf(S.pickedId) : null) ?? allFlows().find((f) => f.requests.length)
+  if (!flow?.requests.length) return fit()
+  frame(flow.requests, { least: 0.72, most: 1 })
+}
+
+/** Fits a set of requests in the plane, between two zoom levels. */
+function frame(list, { least = ZOOM_MIN, most = 1.1 } = {}) {
+  list = list.filter((req) => S.layout.has(req.id))
   if (!list.length) return
   const r = $('plane').getBoundingClientRect()
+  if (!r.width || !r.height) return
   let minX = Infinity
   let minY = Infinity
   let maxX = -Infinity
@@ -1647,15 +2253,24 @@ function fit() {
   for (const req of list) {
     const at = S.layout.get(req.id)
     const n = document.querySelector(`.node[data-id="${req.id}"]`)
-    const h = n ? n.offsetHeight : 110
-    minX = Math.min(minX, at.x)
-    minY = Math.min(minY, at.y)
-    maxX = Math.max(maxX, at.x + NODE_W)
-    maxY = Math.max(maxY, at.y + h)
+    const h = n ? n.offsetHeight : 140
+    minX = Math.min(minX, at.x - 16)
+    // The lane header sits above the first node of each flow.
+    minY = Math.min(minY, at.y - 48)
+    maxX = Math.max(maxX, at.x + NODE_W + 16)
+    maxY = Math.max(maxY, at.y + h + 16)
   }
-  const pad = 52
-  const z = clamp(Math.min((r.width - pad * 2) / (maxX - minX), (r.height - pad * 2) / (maxY - minY)), 0.3, 1.1)
-  S.view = { z, x: pad - minX * z, y: pad - minY * z }
+  const pad = 44
+  // The floating toolbar sits over the foot of the plane, so things are
+  // framed above it rather than underneath it.
+  const below = 72
+  const z = clamp(Math.min((r.width - pad * 2) / (maxX - minX), (r.height - pad - below) / (maxY - minY)), least, most)
+  // Centred in the space it has; when it is wider than the plane, its left
+  // edge leads, which is where a flow starts.
+  const wide = (maxX - minX) * z > r.width - pad * 2
+  const x = wide ? pad - minX * z : (r.width - (maxX - minX) * z) / 2 - minX * z
+  const y = pad + Math.max(0, (r.height - pad - below - (maxY - minY) * z) / 2) - minY * z
+  S.view = { z, x, y }
   applyView()
 }
 
@@ -1822,14 +2437,15 @@ function paintRespStats(res) {
     host.append(el('span', { class: 'code bad', text: 'no response' }))
     return
   }
-  host.append(el('span', { class: `code ${tone(res.status)}`, text: `${res.status} ${word(res.status)}` }))
+  host.append(el('span', { class: `code ${tone(res.status)}`, title: `${res.status} ${word(res.status)}`, text: String(res.status) }))
   host.append(el('span', { class: 'stat', text: `${res.timing?.total ?? 0} ms` }))
   host.append(el('span', { class: 'stat', text: fmtBytes(res.bytes) }))
   if (res.checks.length) {
     host.append(
       el('span', {
         class: `stat ${res.failed ? 'fail' : 'pass'}`,
-        text: res.failed ? `${res.failed} of ${res.checks.length} failed` : `${res.checks.length} passed`
+        title: res.failed ? `${res.failed} of ${res.checks.length} assertions failed` : `All ${res.checks.length} assertions passed`,
+        text: res.failed ? `✕ ${res.failed}/${res.checks.length}` : `✓ ${res.checks.length}/${res.checks.length}`
       })
     )
   }
@@ -1992,12 +2608,20 @@ function openLevel(owner, what) {
     blurb: 'Set once here instead of on every request. The nearest setting always wins.',
     body,
     acts: [],
-    onClose: () => commit()
+    onClose: () => {
+      sheetRepaint = null
+      commit()
+    }
   })
+  sheetRepaint = paint
 }
 
 function rowsPanel(req, key, label, kHint, vHint, hint, repaint) {
-  const box = el('div')
+  const box = el('div', { class: 'kvbox' })
+  // The same panel edits a collection's or a flow's headers, which have no
+  // URL or preview: live() on one of those wrote "undefined" into the
+  // workbench's request preview.
+  const edited = () => ('method' in req ? live(req) : touch())
   box.append(el('div', { class: 'lbl' }, [el('span', { text: label }), hint ? el('em', { text: hint }) : null]))
   const list = (req[key] ??= [])
 
@@ -2011,22 +2635,26 @@ function rowsPanel(req, key, label, kHint, vHint, hint, repaint) {
         } }),
         el('input', { class: 'cell k', value: r.key, placeholder: kHint, 'aria-label': 'Name', oninput: (e) => {
           r.key = e.target.value
-          live(req)
+          edited()
         } }),
         el('input', { class: 'cell v', value: r.value, placeholder: vHint, 'aria-label': 'Value', oninput: (e) => {
           r.value = e.target.value
-          live(req)
+          edited()
         } }),
         el('button', { class: 'x-btn', type: 'button', 'aria-label': `Remove ${r.key || 'row'}`, html: ico(I.x, 11, 2.3), onclick: () => {
           req[key] = list.filter((x) => x.id !== r.id)
           commit()
+          repaint?.()
         } })
       ])
     )
   }
 
+  // An empty table says so, rather than leaving a heading over nothing.
+  if (!list.length) box.append(el('p', { class: 'kv-empty', text: `Nothing here yet — e.g. ${kHint} = ${vHint}` }))
+
   box.append(
-    el('button', { class: 'addbtn', type: 'button', html: `${ico(I.plus, 10, 2.4)}<span>Add</span>`, onclick: () => {
+    el('button', { class: 'addbtn', type: 'button', html: `${ico(I.plus, 10, 2.4)}<span>Add a row</span>`, onclick: () => {
       list.push(row())
       paintBench()
       // Inside a sheet nothing else repaints, so without this the new row
@@ -2867,6 +3495,7 @@ async function attachDataset(req) {
 async function runDataset(req) {
   const ds = req.dataset
   if (!ds?.rows.length) return
+  if (!(await productionOk(`${req.name}, once for each of ${ds.rows.length} rows,`))) return
 
   const state = ds.rows.map((r, i) => ({ label: labelFor(r, i), status: 'wait', ms: 0, code: 0, failed: 0 }))
   const body = el('div', { class: 'suite' })
@@ -2960,24 +3589,6 @@ function briefPanel(req) {
       el('dd', { text: req.auth?.kind ?? 'none' })
     ])
   )
-
-  if (req.recorded) {
-    box.append(el('div', { class: 'lbl', style: 'margin-top:14px' }, [el('span', { text: 'When recorded' })]))
-    box.append(
-      el('dl', { class: 'pairs' }, [
-        el('dt', { text: 'Status' }),
-        el('dd', { text: `${req.recorded.status} ${req.recorded.statusText}` }),
-        el('dt', { text: 'Took' }),
-        el('dd', { text: `${req.recorded.durationMs}ms` }),
-        el('dt', { text: 'Size' }),
-        el('dd', { text: fmtBytes(req.recorded.bytes) })
-      ])
-    )
-    if (req.recorded.responseBody) {
-      box.append(el('div', { class: 'lbl', style: 'margin-top:12px' }, [el('span', { text: 'Example payload' })]))
-      box.append(source(prettyJson(req.recorded.responseBody)))
-    }
-  }
 
   const runs = S.history.filter((h) => h.requestId === req.id)
   if (runs.length) {
@@ -3563,20 +4174,28 @@ function drift(req) {
 
 /* ================================================================ sending */
 
-async function send(req) {
-  if (S.busy.has(req.id)) return
-
-  // Production is named, never blocked — a suite that will not touch it is not
-  // much of a suite — but it is worth one deliberate press.
+/**
+ * One deliberate press before anything goes to production.
+ *
+ * Named, never blocked — a suite that will not touch production is not much of
+ * a suite. Asked once per *run*: asking per request meant a flow opened one
+ * confirm per parallel request, each replacing the last, and the run waited
+ * forever on dialogs that were no longer on screen. The ten-times and dataset
+ * runs did not ask at all.
+ */
+async function productionOk(what) {
   const env = environment()
-  if (S.prefs.confirmProduction !== false && env && /prod|live|release/i.test(env.name)) {
-    const go = await ask({
-      title: `Send to ${env.name}?`,
-      blurb: `This environment is named like production, and ${req.method} ${buildUrl(req, envValues())} really will be sent.`,
-      danger: 'Send it'
-    })
-    if (!go) return
-  }
+  if (S.prefs.confirmProduction === false || !env || !/prod|live|release/i.test(env.name)) return true
+  return ask({
+    title: `Send to ${env.name}?`,
+    blurb: `This environment is named like production, and ${what} really will be sent.`,
+    danger: 'Send it'
+  })
+}
+
+async function send(req, { confirmed = false, quiet = false } = {}) {
+  if (S.busy.has(req.id)) return
+  if (!confirmed && !(await productionOk(`${req.method} ${buildUrl(req, envValues())}`))) return
 
   S.busy.add(req.id)
   commit()
@@ -3592,7 +4211,8 @@ async function send(req) {
   // landing on Result is the tool deciding what you meant to look at.
   if (S.respTab === 'brief') S.respTab = out.failed ? 'notes' : 'result'
   commit()
-  toast(out.failed ? 'bad' : 'ok', `${req.name} — ${out.status} in ${out.timing.total}ms`)
+  // A run reports once, at the end; a toast per request stacked four deep.
+  if (!quiet) toast(out.failed ? 'bad' : 'ok', `${req.name} — ${out.status} in ${out.timing.total}ms`)
 }
 
 /**
@@ -3619,7 +4239,7 @@ async function sendOnce(req, vars) {
 
   const spec = {
     ...compile(resolved, vars),
-    timeoutMs: req.timeoutMs ?? Number(S.prefs.timeoutMs) ?? 30000,
+    timeoutMs: Number(req.timeoutMs) || Number(S.prefs.timeoutMs) || 30000,
     followRedirects: S.prefs.followRedirects !== false,
     verifyTls: S.prefs.verifyTls !== false,
     useCookies: S.prefs.useCookies !== false,
@@ -3686,6 +4306,9 @@ function remember(req, result) {
     failed: result.failed
   })
   S.history = S.history.slice(0, Math.max(10, Number(S.prefs.historyLimit) || 80))
+  // Runs are kept with the workspace, and a capture may have changed the
+  // environment; both need the autosave to hear about it.
+  touch()
 }
 
 /* ============================================================== from curl */
@@ -3822,8 +4445,6 @@ async function doImport() {
 
 const sourceLabel = (s) =>
   ({
-    'rebind-workspace': 'a Rebind recording',
-    'rebind-suite': 'a Rebind flow',
     postman: 'a Postman collection',
     'postman-environment': 'a Postman environment',
     openapi: 'an OpenAPI document',
@@ -3843,68 +4464,11 @@ function applyImport(result) {
     S.environments.push(...result.environments)
     if (!S.envId) S.envId = S.environments[0].id
   }
-  if (result.recorded?.length) {
-    S.recorded.push(...result.recorded)
-    paintIntake()
-  }
   const n = countRequests(result)
   toast('ok', `${result.name} — ${n} request${n === 1 ? '' : 's'} from ${sourceLabel(result.source)}`)
   if (!S.pickedId) S.pickedId = allRequests()[0]?.id ?? ''
   commit()
-  setTimeout(fit, 30)
-}
-
-function paintIntake() {
-  const panel = $('intake')
-  if (!S.recorded.length) {
-    panel.hidden = true
-    return
-  }
-  panel.hidden = false
-  $('intakeCount').textContent = `${S.recorded.length} recorded`
-  const rows = $('intakeRows')
-  rows.replaceChildren()
-  S.recorded.forEach((req, i) => {
-    rows.append(
-      el('button', { class: 'inrow', type: 'button', style: `animation-delay:${Math.min(i * 45, 550)}ms`, title: 'Turn into a test', onclick: () => convert(req) }, [
-        el('span', { class: `verb ${req.method.toLowerCase()}`, text: req.method }),
-        el('span', { class: 'p', text: shortPath(req.url) }),
-        el('span', { class: `code ${tone(req.recorded?.status ?? 0)}`, text: String(req.recorded?.status ?? 0) }),
-        el('span', { class: 'ms', text: `${req.recorded?.durationMs ?? 0}ms` })
-      ])
-    )
-  })
-}
-
-/**
- * A recorded call becomes a test, with assertions proposed from what it
- * actually did — the whole reason recording is worth anything.
- */
-function convert(req) {
-  let json
-  try {
-    json = JSON.parse(req.recorded?.responseBody ?? '')
-  } catch {
-    json = undefined
-  }
-  req.assertions = suggestFor(req.recorded, json)
-
-  let col = S.collections.find((c) => c.source === 'rebind-workspace') ?? S.collections[0]
-  if (!col) {
-    col = emptyCollection('Recorded', [])
-    S.collections.push(col)
-  }
-  let flow = col.flows.find((f) => f.name === 'Recorded')
-  if (!flow) {
-    flow = emptyFlow('Recorded')
-    col.flows.push(flow)
-  }
-  flow.requests.push(req)
-  S.recorded = S.recorded.filter((r) => r !== req)
-  S.pickedId = req.id
-  paintIntake()
-  commit()
-  toast('ok', `${req.name} — ${req.assertions.length} assertions proposed`)
+  setTimeout(focusFlow, 30)
 }
 
 /* ================================================================= export */
@@ -3920,109 +4484,114 @@ function convert(req) {
  */
 let exportTarget = 'curl'
 
+/**
+ * What an export writes: the request as it is actually sent.
+ *
+ * A request set to Inherit, under a collection holding the bearer token,
+ * exported with no Authorization at all -- so the exported cURL and the CLI
+ * run disagreed about the same request.
+ */
+const asSent = (req) => (req ? withInherited(req, chainFor(req)) : req)
+const flowAsSent = (flow) => (flow ? { ...flow, requests: flow.requests.map(asSent) } : flow)
+
+/** A collection exported whole: every flow's requests, in order. */
+const collectionAsFlow = (col) => ({ id: col.id, name: col.name, requests: col.flows.flatMap((f) => f.requests) })
+
 function openExport(onlyFlow, onlyRequest) {
   const req = onlyRequest !== undefined ? onlyRequest : current()
-  const flow = onlyFlow ?? (req ? flowOf(req.id) : allFlows()[0])
+  // Guarded: a click handler hands over its Event, and an Event is not a flow.
+  const given = Array.isArray(onlyFlow?.requests) ? onlyFlow : null
+  const flow = given ?? (req ? flowOf(req.id) : allFlows()[0])
   if (!req && !flow) {
     toast('bad', 'There is nothing to export yet.')
     return
   }
   let scope = req ? 'request' : 'flow'
 
-  const veil = $('veil')
-  veil.replaceChildren()
-  veil.hidden = false
-  sheetUp = true
-  onSheetClose = null
-
-  const shell = el('div', { class: 'page export-page' })
-
   const paint = () => {
     const whole = WHOLE_FLOW.has(exportTarget) || scope === 'flow'
-    const subject = whole ? flow : req
     const code = generate(exportTarget, {
-      request: scope === 'request' ? req : null,
-      flow,
+      request: scope === 'request' ? asSent(req) : null,
+      flow: flowAsSent(flow),
       environment: environment()
     })
     const spec = TARGETS.find((t) => t.id === exportTarget)
     const name = `${slug(whole ? (flow?.name ?? 'flow') : (req?.name ?? 'request'))}.${spec.ext}`
 
-    /* left: the targets, grouped */
-    const nav = el('nav', { class: 'page-nav' }, [el('h3', { text: 'Export' })])
-    if (req && flow) {
-      nav.append(
-        el('div', { class: 'seg export-scope' }, [
-          el('button', { class: `segbtn${scope === 'request' ? ' on' : ''}`, type: 'button', text: 'This request', onclick: () => {
-            scope = 'request'
-            paint()
-          } }),
-          el('button', { class: `segbtn${scope === 'flow' ? ' on' : ''}`, type: 'button', text: 'Whole flow', onclick: () => {
-            scope = 'flow'
-            paint()
-          } })
-        ])
-      )
-    }
+    /* the sidebar: every target, grouped */
+    const nav = el('nav', { class: 'page-nav' }, [pageNavHead('export', 'Export')])
     for (const group of GROUPS) {
       const items = TARGETS.filter((t) => t.group === group)
       if (!items.length) continue
       nav.append(el('h4', { class: 'nav-group', text: group }))
+      const list = el('div', { class: 'page-sections' })
       for (const t of items) {
-        nav.append(
+        list.append(
           el('button', { class: t.id === exportTarget ? 'on' : '', type: 'button', onclick: () => {
             exportTarget = t.id
             paint()
           } }, [
             el('span', { class: 'exp-ext', text: `.${t.ext.split('.').pop()}` }),
-            el('span', { class: 'menu-label', text: t.label })
+            el('span', { class: 'page-label', text: t.label })
           ])
         )
       }
+      nav.append(list)
     }
     nav.append(el('span', { class: 'spacer' }))
     nav.append(el('footer', { html: 'Variables stay variables.<br />No credential is ever resolved into a file.' }))
 
-    /* right: the file */
+    /* the hero: what is being exported, which scope, and what to do with it */
     const lines = code.split('\n').length
-    const main = el('div', { class: 'page-main' }, [
-      el('div', { class: 'page-head' }, [
-        el('h2', { text: spec.label }),
-        el('p', {
-          text: whole
-            ? `Every request in ${flow?.name ?? 'the flow'} — ${flow?.requests.length ?? 0} of them.`
-            : `${req?.method} ${shortPath(req?.url ?? '')}`
-        })
-      ]),
+    const subject = whole
+      ? `Every request in ${flow?.name ?? 'the flow'} — ${flow?.requests.length ?? 0} of them`
+      : `${req?.method} ${shortPath(req?.url ?? '')}`
+    const copy = () => {
+      navigator.clipboard.writeText(code)
+      toast('ok', 'Copied to the clipboard')
+    }
+    const save = async () => {
+      const path = await window.prism.file.save({
+        name,
+        text: code,
+        filters: [{ name: 'File', extensions: [name.split('.').pop()] }]
+      })
+      if (path?.error) toast('bad', `Could not write that file: ${path.error}`)
+      else if (path) toast('ok', `Written to ${path}`)
+    }
+    const hero = pageHero(spec.label, subject, [
+      // Only offered when there is a choice to make, and never for a
+      // collection format, which is always the whole flow.
+      req && flow && !WHOLE_FLOW.has(exportTarget)
+        ? el('div', { class: 'seg export-scope' }, [
+            el('button', { class: `segbtn${scope === 'request' ? ' on' : ''}`, type: 'button', text: 'This request', onclick: () => {
+              scope = 'request'
+              paint()
+            } }),
+            el('button', { class: `segbtn${scope === 'flow' ? ' on' : ''}`, type: 'button', text: 'Whole flow', onclick: () => {
+              scope = 'flow'
+              paint()
+            } })
+          ])
+        : null,
+      el('button', { class: 'btn', type: 'button', html: `${ico(I.copy, 12, 2)}<span>Copy</span>`, onclick: copy }),
+      el('button', { class: 'btn go', type: 'button', html: `${ico(I.save, 12, 2)}<span>Save file</span>`, onclick: save })
+    ].filter(Boolean))
+
+    /* the file, as an editor pane filling the page */
+    const body = el('section', { class: 'file-card' }, [
       el('div', { class: 'file-bar' }, [
-        el('span', { class: 'file-name', text: name }),
+        el('span', { class: 'file-tab' }, [el('span', { class: 'file-dot' }), el('span', { class: 'file-name', text: name })]),
         el('span', { class: 'pane-gap' }),
-        el('span', { class: 'stat', text: `${lines} line${lines === 1 ? '' : 's'}` }),
-        el('button', { class: 'btn', type: 'button', text: 'Copy', onclick: () => {
-          navigator.clipboard.writeText(code)
-          toast('ok', 'Copied')
-        } }),
-        el('button', { class: 'btn go', type: 'button', text: 'Save file', onclick: async () => {
-          const path = await window.prism.file.save({
-            name,
-            text: code,
-            filters: [{ name: 'File', extensions: [name.split('.').pop()] }]
-          })
-          if (path) toast('ok', `Written to ${path}`)
-        } })
+        el('span', { class: 'file-meta', text: `${lines} line${lines === 1 ? '' : 's'} · ${spec.group}` })
       ]),
-      el('div', { class: 'page-body file-body' }, [source(code)])
+      el('div', { class: 'file-body' }, [source(code)])
     ])
 
-    shell.replaceChildren(nav, main)
-    shell.append(el('button', { class: 'page-close', type: 'button', 'aria-label': 'Close', html: ico(I.x, 14, 2.2), onclick: closeSheet }))
+    mountPage('export', { nav, hero, body, trail: spec.label })
   }
 
   paint()
-  veil.append(shell)
-  veil.onpointerdown = (e) => {
-    if (e.target === veil) closeSheet()
-  }
 }
 
 /* =========================================================== environments */
@@ -4058,6 +4627,7 @@ function openEnvironments(id) {
     id: env.id,
     label: env.name || 'Untitled',
     icon: env.id === S.envId ? I.check : I.globe,
+    badge: Object.keys(env.values ?? {}).length,
     head: () => envHead(env),
     render: () => envPanel(env)
   }))
@@ -4245,52 +4815,62 @@ function newEnvironment() {
 /** The head: the name, edited where it is read, and what can be done to it. */
 function envHead(env) {
   const inUse = env.id === S.envId
-  const box = el('div', { class: 'envhead' })
+  const count = Object.keys(env.values ?? {}).length
+  const users = allRequests().filter((r) => variablesUsed(r).some((v) => v in (env.values ?? {}))).length
+  const risky = /prod|live|release/i.test(env.name)
 
-  box.append(
-    el('div', { class: 'envhead-top' }, [
-      el('input', {
-        class: 'envtitle',
-        value: env.name,
-        'aria-label': 'Environment name',
-        spellcheck: 'false',
-        oninput: (e) => {
-          env.name = e.target.value
-          paintBar()
-          touch()
-        },
-        onchange: () => {
-          commit()
-          openEnvironments(env.id)
-        }
-      }),
-      inUse
-        ? el('span', { class: 'inuse', html: ico(I.check, 11, 2.6) + '<span>In use</span>' })
-        : el('button', {
-            class: 'btn go',
-            type: 'button',
-            text: 'Use this one',
-            onclick: () => {
-              S.envId = env.id
+  return el('div', { class: 'envhead' }, [
+    el('div', { class: 'envhead-main' }, [
+      el('span', { class: `envhead-dot${inUse ? ' on' : ''}${risky ? ' risky' : ''}` }),
+      el('div', { class: 'envhead-words' }, [
+        el('div', { class: 'envhead-title' }, [
+          el('input', {
+            class: 'envtitle',
+            value: env.name,
+            'aria-label': 'Environment name',
+            spellcheck: 'false',
+            'data-keep': 'env-title',
+            oninput: (e) => {
+              env.name = e.target.value
+              paintBar()
+              touch()
+            },
+            onchange: () => {
               commit()
-              toast('ok', 'Switched to ' + (env.name || 'that environment'))
               openEnvironments(env.id)
             }
           }),
-      el('button', { class: 'btn', type: 'button', text: 'Duplicate', onclick: () => duplicateEnvironment(env) }),
-      el('button', { class: 'btn danger', type: 'button', text: 'Delete', onclick: () => askDeleteEnvironment(env) })
+          inUse
+            ? el('span', { class: 'envbadge on', html: `${ico(I.check, 10, 2.8)}<span>Active</span>` })
+            : el('span', { class: 'envbadge', text: 'Not active' }),
+          risky ? el('span', { class: 'envbadge risky', html: `${ico(I.alert, 10, 2.4)}<span>Production</span>` }) : null
+        ]),
+        el('p', {
+          class: 'envhead-sub',
+          text: `${count} variable${count === 1 ? '' : 's'} · used by ${users} request${users === 1 ? '' : 's'} · ${
+            inUse ? 'every request resolves {{name}} against this one' : `requests resolve against ${environment()?.name || 'nothing'} right now`
+          }`
+        })
+      ])
+    ]),
+    el('div', { class: 'page-hero-acts' }, [
+      inUse
+        ? null
+        : el('button', {
+            class: 'btn go',
+            type: 'button',
+            html: `${ico(I.check, 11, 2.6)}<span>Make active</span>`,
+            onclick: () => {
+              S.envId = env.id
+              commit()
+              toast('ok', `Requests now resolve against ${env.name || 'that environment'}`)
+              openEnvironments(env.id)
+            }
+          }),
+      el('button', { class: 'btn', type: 'button', html: `${ico(I.copy, 12, 2)}<span>Duplicate</span>`, onclick: () => duplicateEnvironment(env) }),
+      el('button', { class: 'btn bad', type: 'button', html: `${ico(I.bin, 12, 2)}<span>Delete</span>`, onclick: () => askDeleteEnvironment(env) })
     ])
-  )
-
-  box.append(
-    el('p', {
-      class: 'envhead-sub',
-      text: inUse
-        ? 'Every request resolves {{name}} against this environment.'
-        : 'Selected for editing. Requests still resolve against ' + (environment()?.name || 'nothing') + '.'
-    })
-  )
-  return box
+  ])
 }
 
 function duplicateEnvironment(env) {
@@ -4367,143 +4947,161 @@ function envPanel(env) {
   if (/prod|live|release/i.test(env.name)) {
     box.append(
       el('div', { class: 'envwarn' }, [
-        el('span', { class: 'envwarn-ico', html: ico(I.alert, 13, 2) }),
+        el('span', { class: 'envwarn-ico', html: ico(I.alert, 14, 2) }),
         el('p', {
-          text: 'This environment is named like production. Prism will not stop you — a suite that refuses to touch production is not much of a suite — but every request really is sent.'
+          html: '<strong>This environment is named like production.</strong> Prism asks once before a run sends anything here, and every request really is sent.'
         })
       ])
     )
   }
 
-  const chips = el('div', { class: 'envchips' })
-  const chip = (n, label, kind, title) => {
-    if (n) chips.append(el('span', { class: 'envchip ' + kind, title: title ?? '' }, [el('b', { text: String(n) }), el('span', { text: label })]))
-  }
-  chip(a.defined.length, a.defined.length === 1 ? 'variable' : 'variables', 'plain', 'Defined here')
-  chip(a.secrets.length, 'secret', 'lock', 'Hidden here, and never written to disk or into an export')
-  chip(a.missing.length, 'missing', 'bad', 'Referred to by a request, and provided by nothing')
-  chip(a.unmarked.length, 'unmarked', 'warn', 'Reads like a credential but is not marked secret')
-  chip(a.shadowed.length, 'shadowed', 'warn', 'Also captured at run time — the captured value wins')
-  chip(a.refill.length, 'to refill', 'bad', 'A secret whose value was not saved — reopening a workspace leaves these empty')
-  chip(a.unused.length, 'unused', 'quiet', 'Defined here, referred to by nothing')
-  if (chips.children.length) box.append(chips)
+  /* the health strip: how this environment lines up with the requests */
+  const stat = (n, label, kind, title) =>
+    el('div', { class: `envstat${kind ? ` ${kind}` : ''}${n ? '' : ' zero'}`, title }, [el('b', { text: String(n) }), el('span', { text: label })])
+  box.append(
+    el('div', { class: 'envstats' }, [
+      stat(a.defined.length, a.defined.length === 1 ? 'Variable' : 'Variables', '', 'Defined in this environment'),
+      stat(a.secrets.length, a.secrets.length === 1 ? 'Secret' : 'Secrets', 'lock', 'Hidden here, and never written to disk or into an export'),
+      stat(a.missing.length, 'Missing', a.missing.length ? 'bad' : '', 'Referred to by a request, and provided by nothing'),
+      stat(a.refill.length, 'To refill', a.refill.length ? 'bad' : '', 'A secret whose value was not saved'),
+      stat(a.unused.length, 'Unused', a.unused.length ? 'quiet' : '', 'Defined here, referred to by nothing')
+    ])
+  )
 
+  /* what needs doing, in one place */
+  const issues = []
+  for (const name of a.missing) {
+    const who = allRequests().filter((r) => variablesUsed(r).includes(name))
+    issues.push(
+      el('div', { class: 'envissue bad' }, [
+        el('span', { class: 'envissue-ico', html: ico(I.alert, 13, 2) }),
+        el('div', { class: 'envissue-words' }, [
+          el('b', {}, [el('code', { text: `{{${name}}}` }), document.createTextNode(' is not set anywhere')]),
+          el('span', { title: who.map((r) => r.name).join('\n'), text: `Needed by ${who.length === 1 ? who[0].name : `${who.length} requests`}` })
+        ]),
+        el('button', { class: 'btn', type: 'button', text: 'Add here', onclick: () => {
+          env.values[name] = ''
+          commit()
+          repaint()
+        } })
+      ])
+    )
+  }
   if (a.unmarked.length) {
-    box.append(
-      el('div', { class: 'envnudge' }, [
-        el('p', {
-          html:
-            'The name of <code>' +
-            esc(a.unmarked[0]) +
-            '</code>' +
-            (a.unmarked.length > 1 ? ' and ' + (a.unmarked.length - 1) + ' more' : '') +
-            ' reads like a credential. Marking it secret keeps it out of exports and off this disk.'
-        }),
-        el('button', {
-          class: 'tiny go',
-          type: 'button',
-          text: a.unmarked.length > 1 ? 'Mark all as secret' : 'Mark as secret',
-          onclick: () => {
-            env.secrets = [...new Set([...(env.secrets ?? []), ...a.unmarked])]
-            commit()
-            toast('ok', a.unmarked.length + ' marked secret')
-            repaint()
-          }
-        })
+    issues.push(
+      el('div', { class: 'envissue warn' }, [
+        el('span', { class: 'envissue-ico', html: ico(I.lock, 13, 2) }),
+        el('div', { class: 'envissue-words' }, [
+          el('b', {}, [
+            el('code', { text: a.unmarked[0] }),
+            document.createTextNode(a.unmarked.length > 1 ? ` and ${a.unmarked.length - 1} more read like credentials` : ' reads like a credential')
+          ]),
+          el('span', { text: 'Marking it secret keeps it out of exports and off this disk.' })
+        ]),
+        el('button', { class: 'btn', type: 'button', text: a.unmarked.length > 1 ? 'Mark all secret' : 'Mark secret', onclick: () => {
+          env.secrets = [...new Set([...(env.secrets ?? []), ...a.unmarked])]
+          commit()
+          toast('ok', `${a.unmarked.length} marked secret`)
+          repaint()
+        } })
       ])
     )
   }
-
   if (a.refill.length) {
-    box.append(
-      el('div', { class: 'envnudge' }, [
-        el('p', {
-          html:
-            (a.refill.length === 1 ? 'One secret is empty' : a.refill.length + ' secrets are empty') +
-            ' — <code>' +
-            a.refill.map((n) => esc(n)).slice(0, 3).join('</code>, <code>') +
-            '</code>' +
-            (a.refill.length > 3 ? ' and others' : '') +
-            '. Their values are never saved, so a reopened workspace needs them typed again. In a CI run they come from <code>PRISM_&lt;NAME&gt;</code> instead.'
-        })
-      ])
-    )
-  }
-
-  if (a.missing.length) {
-    const list = el('div', { class: 'envmissing' })
-    list.append(
-      el('div', { class: 'lbl' }, [
-        el('span', { text: 'Nothing provides these' }),
-        el('em', { text: 'a request asks for them, and no environment or capture sets them' })
-      ])
-    )
-    for (const name of a.missing) {
-      const who = allRequests().filter((r) => variablesUsed(r).includes(name))
-      list.append(
-        el('div', { class: 'missrow' }, [
-          el('code', { text: '{{' + name + '}}' }),
-          el('span', { class: 'missby', title: who.map((r) => r.name).join('\n'), text: who.length === 1 ? who[0].name : who.length + ' requests' }),
-          el('button', {
-            class: 'tiny go',
-            type: 'button',
-            text: 'Add it here',
-            onclick: () => {
-              env.values[name] = ''
-              commit()
-              repaint()
-            }
-          })
+    issues.push(
+      el('div', { class: 'envissue bad' }, [
+        el('span', { class: 'envissue-ico', html: ico(I.unlock, 13, 2) }),
+        el('div', { class: 'envissue-words' }, [
+          el('b', { text: `${a.refill.length === 1 ? 'One secret is' : `${a.refill.length} secrets are`} empty: ${a.refill.slice(0, 3).join(', ')}${a.refill.length > 3 ? '…' : ''}` }),
+          el('span', { html: 'Secret values are never saved, so a reopened workspace needs them typed again. In CI they come from <code>PRISM_&lt;NAME&gt;</code>.' })
         ])
-      )
-    }
-    box.append(list)
-  }
-
-  const head = el('div', { class: 'lbl varlbl' }, [
-    el('span', { text: 'Variables' }),
-    el('em', { text: 'referred to as {{name}}' }),
-    el('span', { class: 'pane-gap' })
-  ])
-  if (a.defined.length > 6) {
-    // The same box the response search uses, so the two read as one control
-    // rather than two different ideas of what a filter looks like.
-    const field = el('input', {
-      class: 'find-field',
-      type: 'search',
-      value: envFind,
-      placeholder: 'Filter',
-      'aria-label': 'Filter variables',
-      spellcheck: 'false',
-      oninput: (e) => {
-        envFind = e.target.value
-        const at = e.target.selectionStart
-        repaint()
-        // Repainting replaces the field, so the caret has to be put back or
-        // the second character starts a new search.
-        const next = document.querySelector('.varlbl .find-field')
-        if (next) {
-          next.focus()
-          next.setSelectionRange(at, at)
-        }
-      }
-    })
-    head.append(
-      el('div', { class: 'find-bar-row varfind' }, [el('span', { class: 'find-icon', html: ico(I.search, 12, 2) }), field])
+      ])
     )
   }
-  box.append(head)
+  if (issues.length) {
+    box.append(
+      el('section', { class: 'ov-card envissues' }, [
+        el('header', { class: 'ov-card-head' }, [
+          el('h3', { text: 'Needs attention' }),
+          el('span', { text: `${issues.length} thing${issues.length === 1 ? '' : 's'} to fix before every request can run` }),
+          a.missing.length > 1
+            ? el('button', { class: 'btn', type: 'button', text: `Add all ${a.missing.length}`, onclick: () => {
+                for (const name of a.missing) env.values[name] = ''
+                commit()
+                repaint()
+              } })
+            : null
+        ]),
+        ...issues
+      ])
+    )
+  }
 
-  const q = envFind.trim().toLowerCase()
-  const rows = Object.entries(env.values ?? {}).filter(([k, v]) => !q || (k + ' ' + v).toLowerCase().includes(q))
+  /* the variables */
+  const all = Object.entries(env.values ?? {})
+  const filter = el('input', {
+    class: 'set-search',
+    type: 'search',
+    value: envFind,
+    placeholder: 'Filter variables',
+    'aria-label': 'Filter variables',
+    spellcheck: 'false',
+    // Filters the rows already on screen rather than redrawing the page, so
+    // typing never loses the caret.
+    oninput: (e) => {
+      envFind = e.target.value
+      const q = envFind.trim().toLowerCase()
+      let shown = 0
+      for (const row of box.querySelectorAll('.vrow')) {
+        const hit = !q || row.dataset.find.includes(q)
+        row.hidden = !hit
+        if (hit) shown += 1
+      }
+      const none = box.querySelector('.vnone')
+      if (none) none.hidden = shown > 0 || !all.length
+    }
+  })
 
-  if (!Object.keys(env.values ?? {}).length) {
-    box.append(el('p', { class: 'note', text: 'No variables yet. Add one, or paste a block of them.' }))
-  } else if (!rows.length) {
-    box.append(el('p', { class: 'note', text: 'Nothing matches \u201c' + envFind + '\u201d.' }))
+  const card = el('section', { class: 'ov-card vcard' }, [
+    el('header', { class: 'ov-card-head' }, [
+      el('h3', { text: 'Variables' }),
+      el('span', { text: 'Referred to in a request as {{name}}' }),
+      el('label', { class: 'set-find vfind' }, [el('span', { html: ico(I.search, 13, 2) }), filter]),
+      el('button', {
+        class: `btn${envPasting ? ' on' : ''}`,
+        type: 'button',
+        html: `${ico(I.paste, 12, 1.9)}<span>${envPasting ? 'Cancel paste' : 'Paste .env'}</span>`,
+        onclick: () => {
+          envPasting = !envPasting
+          repaint()
+        }
+      }),
+      el('button', {
+        class: 'btn go',
+        type: 'button',
+        html: `${ico(I.plus, 11, 2.4)}<span>Add variable</span>`,
+        onclick: () => {
+          env.values[freeName(env.values)] = ''
+          envFind = ''
+          commit()
+          repaint()
+          requestAnimationFrame(() => [...document.querySelectorAll('.page-environments .vname')].pop()?.select())
+        }
+      })
+    ])
+  ])
+  if (envPasting) card.append(el('div', { class: 'vpaste' }, [pasteBox(env, repaint)]))
+
+  if (!all.length) {
+    card.append(
+      el('div', { class: 'vempty' }, [
+        el('span', { class: 'empty-ico', html: ico('<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1"/><path d="M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"/>', 18, 1.9) }),
+        el('b', { text: 'No variables yet' }),
+        el('span', { text: 'Add one, or paste a block of KEY=value lines from a .env file.' })
+      ])
+    )
   } else {
-    const table = el('div', { class: 'vtable' })
-    table.append(
+    card.append(
       el('div', { class: 'vhead' }, [
         el('span', { text: 'Name' }),
         el('span', { text: 'Value' }),
@@ -4511,53 +5109,28 @@ function envPanel(env) {
         el('span', { class: 'vhead-r', text: '' })
       ])
     )
-    for (const [key, value] of rows) table.append(varRow(env, key, value, captured, repaint))
-    box.append(table)
+    for (const [key, value] of all) card.append(varRow(env, key, value, captured, repaint))
+    card.append(el('p', { class: 'vnone', hidden: true, text: 'No variable matches that filter.' }))
   }
-
-  const acts = el('div', { class: 'envacts' })
-  acts.append(
-    el('button', {
-      class: 'addbtn',
-      type: 'button',
-      html: ico(I.plus, 10, 2.4) + '<span>Add variable</span>',
-      onclick: () => {
-        env.values[freeName(env.values)] = ''
-        envFind = ''
-        commit()
-        repaint()
-      }
-    })
-  )
-  acts.append(
-    el('button', {
-      class: 'addbtn',
-      type: 'button',
-      html: ico(I.paste, 10, 1.9) + '<span>' + (envPasting ? 'Cancel paste' : 'Paste a block') + '</span>',
-      onclick: () => {
-        envPasting = !envPasting
-        repaint()
-      }
-    })
-  )
-  box.append(acts)
-
-  if (envPasting) box.append(pasteBox(env, repaint))
+  box.append(card)
 
   box.append(
     el('p', {
       class: 'envfoot',
-      html:
-        'Values are saved with the workspace, on this machine. A variable marked <strong>secret</strong> is not: its name is kept so a shared workspace says what to refill, and in a CI run it is supplied as <code>PRISM_&lt;NAME&gt;</code>.'
+      html: `${ico(I.lock, 12, 2)}<span>Values are saved with the workspace, on this machine. A <strong>secret</strong> is not: its name is kept so a shared workspace says what to refill, and in CI it is supplied as <code>PRISM_&lt;NAME&gt;</code>.</span>`
     })
   )
+
+  // A filter typed before a repaint still applies after it.
+  if (envFind) requestAnimationFrame(() => filter.dispatchEvent(new Event('input')))
   return box
 }
 
 function varRow(env, key, value, captured, repaint) {
   const secret = (env.secrets ?? []).includes(key)
   const who = allRequests().filter((r) => variablesUsed(r).includes(key))
-  const row = el('div', { class: 'vrow' + (who.length ? '' : ' idle') })
+  const row = el('div', { class: 'vrow' + (who.length ? '' : ' idle') + (secret ? ' secret' : '') })
+  row.dataset.find = `${key} ${secret ? '' : value}`.toLowerCase()
 
   row.append(
     el('input', {
@@ -4579,26 +5152,41 @@ function varRow(env, key, value, captured, repaint) {
     })
   )
 
-  row.append(
-    el('input', {
-      class: 'vval',
-      value: String(value ?? ''),
-      type: secret ? 'password' : 'text',
-      placeholder: secret ? (String(value ?? '') === '' ? 'needs refilling' : 'not written to disk') : 'empty',
-      'aria-label': 'Value of ' + key,
-      spellcheck: 'false',
-      oninput: (e) => {
-        env.values[key] = e.target.value
-        touch()
-      },
-      onchange: () => commit()
-    })
-  )
+  const val = el('input', {
+    class: 'vval',
+    value: String(value ?? ''),
+    type: secret ? 'password' : 'text',
+    placeholder: secret ? (String(value ?? '') === '' ? 'needs refilling' : 'not written to disk') : 'empty',
+    'aria-label': 'Value of ' + key,
+    spellcheck: 'false',
+    oninput: (e) => {
+      env.values[key] = e.target.value
+      touch()
+    },
+    onchange: () => commit()
+  })
+  // A secret can be looked at, for a moment, without unmarking it.
+  const peek = secret
+    ? el('button', {
+        class: 'lockbtn peek',
+        type: 'button',
+        title: 'Show the value',
+        'aria-label': `Show the value of ${key}`,
+        html: ico(I.eye, 12, 2),
+        onclick: () => {
+          val.type = val.type === 'password' ? 'text' : 'password'
+        }
+      })
+    : null
+  row.append(el('div', { class: 'vvalwrap' }, [val, peek]))
 
   row.append(
     who.length
-      ? el('span', { class: 'vused', title: who.map((r) => r.name).join('\n'), text: who.length === 1 ? who[0].name : who.length + ' requests' })
-      : el('span', { class: 'vused none', text: captured.includes(key) ? 'captured instead' : 'nothing' })
+      ? el('span', { class: 'vused', title: who.map((r) => r.name).join('\n') }, [
+          el('i', { class: 'vused-dot' }),
+          document.createTextNode(who.length === 1 ? who[0].name : `${who.length} requests`)
+        ])
+      : el('span', { class: 'vused none', text: captured.includes(key) ? 'captured instead' : 'not used' })
   )
 
   row.append(
@@ -4619,8 +5207,9 @@ function varRow(env, key, value, captured, repaint) {
       el('button', {
         class: 'x-btn',
         type: 'button',
+        title: 'Remove',
         'aria-label': 'Remove ' + key,
-        html: ico(I.x, 11, 2.3),
+        html: ico(I.bin, 12, 2),
         onclick: () => {
           delete env.values[key]
           env.secrets = (env.secrets ?? []).filter((k) => k !== key)
@@ -4701,55 +5290,407 @@ function pasteBox(env, repaint) {
   return box
 }
 
-/* ============================================================ page shell */
+/* ================================================================== pages
+
+   Environments, History, Export, Settings and Help are places, not dialogs.
+   They used to float over the workspace in a box three quarters of the window
+   high, which is the size of a decision, not of work: renaming twenty
+   variables or reading a page of help in it felt like doing it through a
+   letterbox. Each now takes the whole space beside the rail, the rail says
+   which one you are in, and Escape, the Collections icon or the back button
+   returns to the plane exactly as it was. Dialogs still open on top. */
+
+/** Which page is open, or '' for the workspace. */
+let pageOpen = ''
+
+/** Each page's mark, and the line under its name in the sidebar. */
+const PAGE_META = {
+  overview: {
+    rail: 'railHome',
+    icon: '<path d="M4 11 12 4l8 7"/><path d="M6 9.5V20h12V9.5"/><path d="M10 20v-5h4v5"/>',
+    sub: () => `${allRequests().length} requests · ${allFlows().length} flows`
+  },
+  environments: {
+    rail: 'envBtn',
+    icon: '<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1"/><path d="M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"/>',
+    sub: () => `${S.environments.length} environment${S.environments.length === 1 ? '' : 's'} · values for {{name}}`
+  },
+  history: {
+    rail: 'historyBtn',
+    icon: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    sub: () => `${S.history.length} run${S.history.length === 1 ? '' : 's'} kept`
+  },
+  export: {
+    rail: 'railExport',
+    icon: '<path d="M12 14V3"/><path d="m7.5 7.5 4.5-4.5 4.5 4.5"/><path d="M4 20h16"/>',
+    sub: () => 'Code, tests and collections'
+  },
+  settings: {
+    rail: 'settingsBtn',
+    icon: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.3a2 2 0 1 1-4 0v-.2a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 3.5 15H3a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.6 1.6 0 0 0 10 4.5V4a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.3a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.3 1z"/>',
+    sub: () => 'Preferences for this machine'
+  },
+  help: {
+    rail: 'helpBtn',
+    icon: '<circle cx="12" cy="12" r="9"/><path d="M9.2 9.3a2.9 2.9 0 0 1 5.6 1c0 1.9-2.8 2.4-2.8 4"/><path d="M12 17.4h.01"/>',
+    sub: () => 'Guides and shortcuts'
+  }
+}
+
+const PAGE_KIND = { Overview: 'overview', Environments: 'environments', History: 'history', Settings: 'settings', Help: 'help', Export: 'export' }
+
+/** The sidebar's head: the page's mark, its name and a line of context. */
+function pageNavHead(kind, title) {
+  const meta = PAGE_META[kind]
+  return el('div', { class: 'page-brand' }, [
+    el('span', { class: 'page-mark', html: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${meta?.icon ?? ''}</svg>` }),
+    el('div', { class: 'page-brand-words' }, [el('h3', { text: title }), el('span', { text: meta?.sub() ?? '' })])
+  ])
+}
 
 /**
- * The shell Settings and Help share.
+ * Puts a page in the space beside the rail.
  *
- * A nav rail and a scrolling column, at a size where a paragraph is a
- * paragraph. Both are things people read rather than dismiss, and a dialog the
- * size of a confirm is the wrong container for either.
+ *   nav    the page's sidebar
+ *   hero   its title, description and main actions, fixed above the content
+ *   body   what scrolls
+ *   trail  the section within the page, for the breadcrumb
+ *
+ * Opening the page that is already open updates it in place: same scroll
+ * position, no entrance animation. Every switch in Settings and every option
+ * in Export re-renders its page, and doing that by tearing the page down and
+ * fading a new one in is what made the whole window blink on every click.
  */
-function page({ title, sections, active, onPick, navFoot }) {
-  const veil = $('veil')
-  veil.replaceChildren()
-  veil.hidden = false
-  sheetUp = true
-  onSheetClose = null
+function mountPage(kind, { nav, hero = null, body, trail = '' }) {
+  const view = $('view')
+  // A dialog or the palette left open would sit over a page it no longer
+  // belongs to.
+  if (sheetUp) closeSheet()
+  closeMenu()
 
-  const nav = el('nav', { class: 'page-nav' }, [el('h3', { text: title })])
+  const old = pageOpen === kind ? view.querySelector('.page') : null
+  const kept = old
+    ? {
+        // A different section of the same page starts at its top; the same
+        // section, re-rendered, stays where it was.
+        body: old.dataset.trail === trail ? old.querySelector('.page-scroll')?.scrollTop ?? 0 : 0,
+        nav: old.querySelector('.page-nav')?.scrollTop ?? 0,
+        focus: document.activeElement?.dataset?.keep ?? ''
+      }
+    : null
+
+  const top = el('header', { class: 'page-top' }, [
+    el('nav', { class: 'page-crumbs', 'aria-label': 'Location' }, [
+      el('button', { class: 'crumb-home', type: 'button', text: 'Workspace', onclick: closePage }),
+      el('i', { text: '/' }),
+      el('span', { text: Object.keys(PAGE_KIND).find((k) => PAGE_KIND[k] === kind) ?? kind }),
+      trail ? el('i', { text: '/' }) : null,
+      trail ? el('b', { text: trail }) : null
+    ]),
+    el('span', { class: 'pane-gap' }),
+    el('button', { class: 'page-back', type: 'button', title: 'Back to the workspace (Esc)', onclick: closePage }, [
+      el('span', { html: ico(I.chev, 12, 2.4) }),
+      el('span', { text: 'Back to workspace' }),
+      el('kbd', { text: 'Esc' })
+    ])
+  ])
+
+  const scroll = el('div', { class: 'page-scroll' }, [el('div', { class: 'page-inner' }, [body])])
+  const shell = el('div', { class: 'page' }, [nav, el('div', { class: 'page-main' }, [top, hero, scroll])])
+  // Per-page refinements in the stylesheet hang off this.
+  shell.classList.add(`page-${kind}`)
+  shell.dataset.trail = trail
+  if (old) shell.classList.add('steady')
+  view.replaceChildren(shell)
+  view.hidden = false
+  $('stage').classList.add('paged')
+  pageOpen = kind
+  paintRail()
+
+  if (kept) {
+    scroll.scrollTop = kept.body
+    nav.scrollTop = kept.nav
+    if (kept.focus) shell.querySelector(`[data-keep="${kept.focus}"]`)?.focus()
+  }
+  return shell
+}
+
+/** The fixed head of a page: a title and a line under it, and its actions. */
+function pageHero(title, blurb, actions = []) {
+  return el('div', { class: 'page-hero' }, [
+    el('div', { class: 'page-hero-words' }, [el('h2', { text: title }), blurb ? el('p', { text: blurb }) : null]),
+    actions.length ? el('div', { class: 'page-hero-acts' }, actions) : null
+  ])
+}
+
+/** Back to the plane, exactly as it was left. */
+function closePage() {
+  if (!pageOpen) return
+  pageOpen = ''
+  $('view').hidden = true
+  $('view').replaceChildren()
+  $('stage').classList.remove('paged')
+  paintRail()
+  // The plane had no size while hidden, so the wires are drawn again now it
+  // has one.
+  requestAnimationFrame(() => applyView())
+}
+
+/** Opens a page, or closes it if it is the one already open. */
+function togglePage(kind, open) {
+  if (pageOpen === kind) closePage()
+  else open()
+}
+
+/** The rail marks the page you are in; Collections stands for the workspace. */
+function paintRail() {
+  const shown = !$('stage').classList.contains('tree-off')
+  const home = $('railTree')
+  home.classList.toggle('on', !pageOpen && shown)
+  home.setAttribute('aria-pressed', String(!pageOpen && shown))
+  for (const [kind, meta] of Object.entries(PAGE_META)) {
+    const btn = $(meta.rail)
+    if (!btn) continue
+    btn.classList.toggle('on', pageOpen === kind)
+    btn.setAttribute('aria-current', pageOpen === kind ? 'page' : 'false')
+  }
+}
+
+/** The sidebar's list of sections, with an optional count on each. */
+function pageNav(kind, title, sections, active, onPick, navFoot) {
+  const nav = el('nav', { class: 'page-nav' }, [pageNavHead(kind, title)])
+  const list = el('div', { class: 'page-sections' })
   for (const sec of sections) {
-    nav.append(
+    list.append(
       el('button', {
         class: sec.id === active ? 'on' : '',
         type: 'button',
-        html: `${ico(sec.icon, 13, 1.9)}<span>${esc(sec.label)}</span>`,
+        'data-section': sec.id,
+        'aria-current': sec.id === active ? 'page' : 'false',
         onclick: () => onPick(sec.id)
-      })
+      }, [
+        el('span', { class: 'page-ico', html: ico(sec.icon, 14, 1.9) }),
+        el('span', { class: 'page-label', text: sec.label }),
+        sec.badge !== undefined && sec.badge !== '' ? el('span', { class: `page-badge${sec.tone ? ` ${sec.tone}` : ''}`, text: String(sec.badge) }) : null
+      ])
     )
   }
-  // A page whose rail lists things rather than sections needs a way to add
-  // one; Settings and Help pass nothing and are unchanged.
+  nav.append(list)
   if (navFoot) nav.append(navFoot)
   nav.append(el('span', { class: 'spacer' }))
-  nav.append(el('footer', { html: 'Rebind Prism 0.1.0<br />MIT licensed &middot; no account, no key' }))
+  nav.append(el('footer', { html: 'Prism 0.1.0<br />MIT licensed &middot; no account, no key' }))
+  return nav
+}
 
+/**
+ * A page made of sections, one shown at a time: Environments, History, Help
+ * and the Overview. The section's title and actions sit in the fixed hero;
+ * its content fills the width beneath.
+ */
+function page({ title, sections, active, onPick, navFoot }) {
+  const kind = PAGE_KIND[title] ?? title.toLowerCase()
   const sec = sections.find((x) => x.id === active) ?? sections[0]
-  const main = el('div', { class: 'page-main' }, [
-    // A section may draw its own head — an environment's name is editable, and
-    // an h2 you cannot type into is the wrong control for it.
-    sec.head ? el('div', { class: 'page-head' }, [sec.head()]) : el('div', { class: 'page-head' }, [el('h2', { text: sec.label }), sec.blurb ? el('p', { text: sec.blurb }) : null]),
-    el('div', { class: 'page-body' }, [sec.render()])
+  const nav = pageNav(kind, title, sections, sec.id, onPick, navFoot)
+  // A section may draw its own head — an environment's name is editable, and
+  // a heading you cannot type into is the wrong control for it.
+  const hero = sec.head ? el('div', { class: 'page-hero' }, [sec.head()]) : pageHero(sec.label, sec.blurb, sec.actions?.() ?? [])
+  return mountPage(kind, { nav, hero, body: el('div', { class: 'page-body' }, [sec.render()]), trail: sec.label })
+}
+
+/* ================================================================ overview
+
+   The workspace at a glance: how big it is, how its flows are doing, what
+   ran last, and the ways in. Everything on it is a door to somewhere else in
+   the app, so nothing here is a dead end. */
+
+/** "4 min ago", for things that happened this session or recently. */
+function ago(at) {
+  const s = Math.max(0, Math.round((Date.now() - Number(at || 0)) / 1000))
+  if (s < 45) return 'just now'
+  if (s < 3600) return `${Math.round(s / 60)} min ago`
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`
+  return `${Math.round(s / 86400)} d ago`
+}
+
+function median(list) {
+  if (!list.length) return 0
+  const sorted = [...list].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+}
+
+/** Goes back to the plane with one flow framed and its first request picked. */
+function showFlow(flow) {
+  closePage()
+  if (flow.requests[0]) pick(flow.requests[0].id)
+  requestAnimationFrame(() => focusFlow())
+}
+
+function openOverview() {
+  const quick = el('div', { class: 'ov-quick' }, [
+    el('h4', { class: 'nav-group', text: 'Quick actions' }),
+    ...[
+      [I.import, 'Import a collection', 'Postman, OpenAPI, HAR', () => doImport()],
+      [I.terminal, 'Paste a cURL', 'Ctrl Shift V', () => pasteCurl()],
+      [I.plus, 'New request', 'Ctrl N', () => {
+        const flow = workingFlow()
+        if (!flow) return newCollection()
+        closePage()
+        addRequest(flow)
+      }],
+      [I.folder, 'Open a workspace', 'Ctrl O', () => openWorkspace()]
+    ].map(([icon, label, sub, run]) =>
+      el('button', { type: 'button', onclick: run }, [
+        el('span', { class: 'page-ico', html: ico(icon, 14, 1.9) }),
+        el('span', { class: 'page-label' }, [el('span', { text: label }), el('small', { text: sub })])
+      ])
+    )
   ])
 
-  const shell = el('div', { class: 'page' }, [nav, main])
-  shell.append(
-    el('button', { class: 'page-close', type: 'button', 'aria-label': 'Close', html: ico(I.x, 14, 2.2), onclick: closeSheet })
-  )
-  veil.append(shell)
-  veil.onpointerdown = (e) => {
-    if (e.target === veil) closeSheet()
+  page({
+    title: 'Overview',
+    sections: [{ id: 'overview', label: 'Workspace', icon: I.home, head: overviewHead, render: overviewPanel }],
+    active: 'overview',
+    onPick: () => openOverview(),
+    navFoot: quick
+  })
+}
+
+function overviewHead() {
+  return el('div', { class: 'page-head-row' }, [
+    el('div', {}, [
+      el('h2', { text: S.savedName || 'Workspace' }),
+      el('p', { text: S.filePath ? `Saved to ${S.filePath}` : 'Kept in the app. Save it to a file to commit it beside your code or share it.' })
+    ]),
+    el('div', { class: 'ov-head-acts' }, [
+      el('button', { class: 'btn', type: 'button', text: S.filePath ? 'Save' : 'Save to a file', onclick: () => saveWorkspace() }),
+      el('button', {
+        class: 'btn go',
+        type: 'button',
+        html: `${ico(I.play, 10)}<span>Run every flow</span>`,
+        disabled: !allFlows().some((f) => f.requests.length),
+        onclick: () => runEveryFlow()
+      })
+    ])
+  ])
+}
+
+/** Every flow, one after another, from the overview. */
+async function runEveryFlow() {
+  closePage()
+  for (const flow of allFlows()) {
+    if (!flow.requests.length) continue
+    await runFlow(flow)
   }
+}
+
+function overviewPanel() {
+  const box = el('div', { class: 'ov' })
+  const requests = allRequests()
+  const flows = allFlows()
+  const ran = requests.map((r) => S.results.get(r.id)).filter(Boolean)
+  const passed = ran.filter((r) => !r.error && !r.failed).length
+  const times = S.history.map((h) => h.ms).filter((n) => n > 0)
+
+  /* the numbers */
+  const kpi = (value, label, sub, tone = '') =>
+    el('div', { class: `ov-kpi${tone ? ` ${tone}` : ''}` }, [el('b', { text: value }), el('span', { text: label }), sub ? el('small', { text: sub }) : null])
+  box.append(
+    el('div', { class: 'ov-kpis' }, [
+      kpi(String(requests.length), 'Requests', `${S.collections.length} collection${S.collections.length === 1 ? '' : 's'}`),
+      kpi(String(flows.length), 'Flows', `${flows.filter((f) => f.requests.length).length} with requests`),
+      kpi(ran.length ? `${Math.round((passed / ran.length) * 100)}%` : '—', 'Passing', ran.length ? `${passed} of ${ran.length} run` : 'Nothing run yet', !ran.length ? '' : passed === ran.length ? 'pass' : 'fail'),
+      kpi(times.length ? `${median(times)} ms` : '—', 'Median time', times.length ? `over ${times.length} run${times.length === 1 ? '' : 's'}` : 'Send something to see it'),
+      kpi(String(S.environments.length), 'Environments', environment() ? `${environment().name} in use` : 'None in use')
+    ])
+  )
+
+  /* the flows */
+  const flowCard = el('section', { class: 'ov-card' }, [
+    el('header', { class: 'ov-card-head' }, [el('h3', { text: 'Flows' }), el('span', { text: 'How each one went the last time it ran' })])
+  ])
+  if (!flows.length) {
+    flowCard.append(el('p', { class: 'ov-empty', text: 'No flows yet. Import a collection, or start a blank request.' }))
+  }
+  for (const col of S.collections) {
+    for (const flow of col.flows) {
+      const results = flow.requests.map((r) => S.results.get(r.id)).filter(Boolean)
+      const ok = results.filter((r) => !r.error && !r.failed).length
+      const state = !results.length ? 'idle' : ok === results.length ? 'pass' : 'fail'
+      const avg = results.length ? Math.round(results.reduce((n, r) => n + (r.timing?.total ?? 0), 0) / results.length) : 0
+      flowCard.append(
+        el('div', { class: `ov-flow ${state}` }, [
+          el('span', { class: 'lane-dot' }),
+          el('div', { class: 'ov-flow-name' }, [el('b', { text: flow.name || 'Untitled flow' }), el('span', { text: col.name })]),
+          el('span', { class: 'ov-flow-n', text: `${flow.requests.length} request${flow.requests.length === 1 ? '' : 's'}` }),
+          el('div', { class: 'ov-flow-bar', title: results.length ? `${ok} of ${results.length} passing` : 'Not run yet' }, [
+            el('span', { class: 'ok', style: `width:${results.length ? (ok / flow.requests.length) * 100 : 0}%` }),
+            el('span', { class: 'bad', style: `width:${results.length ? ((results.length - ok) / flow.requests.length) * 100 : 0}%` })
+          ]),
+          el('span', { class: 'ov-flow-sum', text: results.length ? `${ok}/${results.length} passed${avg ? ` · ${avg} ms avg` : ''}` : 'Not run yet' }),
+          el('button', { class: 'btn', type: 'button', text: 'Open', onclick: () => showFlow(flow) }),
+          el('button', {
+            class: 'btn go',
+            type: 'button',
+            html: `${ico(I.play, 9)}<span>Run</span>`,
+            disabled: !flow.requests.length,
+            onclick: () => {
+              showFlow(flow)
+              runFlow(flow)
+            }
+          })
+        ])
+      )
+    }
+  }
+
+  /* what happened lately, and where it runs */
+  const recent = el('section', { class: 'ov-card' }, [
+    el('header', { class: 'ov-card-head' }, [el('h3', { text: 'Recent activity' }), el('span', { text: 'The last runs, newest first' })])
+  ])
+  if (!S.history.length) recent.append(el('p', { class: 'ov-empty', text: 'Nothing has run yet. Send a request, or run a flow, and it shows up here.' }))
+  for (const h of S.history.slice(0, 8)) {
+    recent.append(
+      el('button', {
+        class: 'ov-act',
+        type: 'button',
+        onclick: () => {
+          if (!findRequest(h.requestId)) return
+          closePage()
+          pick(h.requestId)
+          reveal(h.requestId)
+        }
+      }, [
+        el('span', { class: `verb ${String(h.method).toLowerCase()}`, text: h.method }),
+        el('span', { class: 'ov-act-name', text: h.name }),
+        el('span', { class: `code ${tone(h.status)}`, text: h.status ? String(h.status) : 'ERR' }),
+        el('span', { class: 'ov-act-ms', text: `${h.ms} ms` }),
+        el('span', { class: 'ov-act-at', text: ago(h.at) })
+      ])
+    )
+  }
+
+  const envs = el('section', { class: 'ov-card' }, [
+    el('header', { class: 'ov-card-head' }, [
+      el('h3', { text: 'Environments' }),
+      el('button', { class: 'btn', type: 'button', text: 'Manage', onclick: () => openEnvironments() })
+    ])
+  ])
+  if (!S.environments.length) envs.append(el('p', { class: 'ov-empty', text: 'No environments. One holds the values that change between machines, like a base URL.' }))
+  const envList = el('div', { class: 'ov-envs' })
+  for (const env of S.environments) {
+    envList.append(
+      el('button', { class: `ov-env${env.id === S.envId ? ' on' : ''}`, type: 'button', onclick: () => openEnvironments(env.id) }, [
+        el('span', { class: `env-dot${env.id === S.envId ? ' on' : ''}${/prod|live|release/i.test(env.name) ? ' risky' : ''}` }),
+        el('b', { text: env.name }),
+        el('span', { text: `${Object.keys(env.values ?? {}).length} variables` })
+      ])
+    )
+  }
+  envs.append(envList)
+
+  box.append(flowCard, el('div', { class: 'ov-split' }, [recent, envs]))
+  return box
 }
 
 /* =============================================================== settings */
@@ -4777,20 +5718,128 @@ const SET_ICON = {
   About: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>'
 }
 
+/** What the settings search box holds, kept across the page's re-renders. */
+let settingsQuery = ''
+
+/**
+ * Settings, as one scrolling page.
+ *
+ * Every group is on it, and the sidebar follows the scroll rather than
+ * swapping the page: there are twenty-odd settings, which is one page's
+ * worth, and a search box finds any of them by name or by what it does.
+ * `section` jumps to a group; without it the page keeps its place, which is
+ * what a re-render after flipping a switch wants.
+ */
 function openSettings(section) {
   if (section) settingsAt = section
-  const sections = [...SET_GROUPS, 'About'].map((g) => ({
-    id: g,
-    label: g,
-    icon: SET_ICON[g],
-    blurb: SET_BLURB[g],
-    render: () => (g === 'About' ? aboutPanel() : settingsGroup(g))
-  }))
-  page({ title: 'Settings', sections, active: settingsAt, onPick: (id) => openSettings(id) })
+  const groups = [...SET_GROUPS, 'About']
+  const nav = pageNav(
+    'settings',
+    'Settings',
+    groups.map((g) => ({ id: g, label: g, icon: SET_ICON[g] })),
+    settingsAt,
+    (id) => jumpToSetting(id)
+  )
+
+  const search = el('input', {
+    class: 'set-search',
+    type: 'search',
+    placeholder: 'Search settings',
+    value: settingsQuery,
+    spellcheck: 'false',
+    'aria-label': 'Search settings',
+    'data-keep': 'set-search',
+    oninput: (e) => {
+      settingsQuery = e.target.value
+      filterSettings()
+    }
+  })
+  const hero = pageHero('Settings', 'Preferences for this machine. They are not part of the workspace, and are never shared with it.', [
+    el('label', { class: 'set-find' }, [el('span', { html: ico(I.search, 14, 2) }), search])
+  ])
+
+  const body = el('div', { class: 'set-groups' }, [
+    ...groups.map((g) =>
+      el('section', { class: 'set-group', id: `set-${g}`, 'data-group': g }, [
+        el('header', { class: 'set-group-head' }, [
+          el('span', { class: 'page-ico', html: ico(SET_ICON[g], 15, 1.9) }),
+          el('div', {}, [el('h3', { text: g }), el('p', { text: SET_BLURB[g] })])
+        ]),
+        g === 'About' ? aboutPanel() : settingsGroup(g)
+      ])
+    ),
+    el('p', { class: 'set-none', hidden: true, text: 'No setting matches that. Try a word from what it does, like “proxy” or “timeout”.' })
+  ])
+
+  const shell = mountPage('settings', { nav, hero, body, trail: settingsAt })
+  filterSettings()
+  const scroll = shell.querySelector('.page-scroll')
+  scroll.addEventListener('scroll', () => spySettings(scroll), { passive: true })
+  if (section) jumpToSetting(section, false)
+}
+
+/** Scrolls a group into view and marks it in the sidebar. */
+function jumpToSetting(group, smooth = true) {
+  const scroll = document.querySelector('.page-settings .page-scroll')
+  const target = document.getElementById(`set-${group}`)
+  if (!scroll || !target) return
+  settingsAt = group
+  markSetting(group)
+  scroll.scrollTo({ top: Math.max(0, target.offsetTop - 24), behavior: smooth ? 'smooth' : 'auto' })
+}
+
+/** The group nearest the top of the view is the one the sidebar marks. */
+function spySettings(scroll) {
+  let at = ''
+  for (const sec of scroll.querySelectorAll('.set-group:not([hidden])')) {
+    if (sec.offsetTop - scroll.scrollTop <= 90) at = sec.dataset.group
+  }
+  // At the very bottom the last group wins, even if it is too short to reach
+  // the top of the view.
+  if (scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 4) {
+    at = [...scroll.querySelectorAll('.set-group:not([hidden])')].pop()?.dataset.group ?? at
+  }
+  if (at && at !== settingsAt) {
+    settingsAt = at
+    markSetting(at)
+  }
+}
+
+function markSetting(group) {
+  for (const b of document.querySelectorAll('.page-settings .page-sections button')) {
+    const on = b.dataset.section === group
+    b.classList.toggle('on', on)
+    b.setAttribute('aria-current', on ? 'page' : 'false')
+  }
+  const crumb = document.querySelector('.page-settings .page-crumbs b')
+  if (crumb) crumb.textContent = group
+  // Scrolling is not changing section: a re-render must keep this place.
+  const shell = document.querySelector('.page-settings')
+  if (shell) shell.dataset.trail = group
+}
+
+/** Shows only the settings whose name or description matches the search. */
+function filterSettings() {
+  const q = settingsQuery.trim().toLowerCase()
+  let any = false
+  for (const sec of document.querySelectorAll('.page-settings .set-group')) {
+    let shown = 0
+    const rows = sec.querySelectorAll('.prefrow')
+    for (const row of rows) {
+      const hit = !q || row.textContent.toLowerCase().includes(q)
+      row.hidden = !hit
+      if (hit) shown += 1
+    }
+    // About has no rows to match; it is only shown with no search.
+    sec.hidden = q ? shown === 0 : false
+    if (!sec.hidden) any = true
+  }
+  const none = document.querySelector('.page-settings .set-none')
+  if (none) none.hidden = any
 }
 
 function settingsGroup(group) {
-  const box = el('div')
+  const box = el('div', { class: 'prefcard' })
   for (const item of SETTINGS.filter((x) => x.group === group)) box.append(settingRow(item, group))
 
   if (group === 'Data') {
@@ -4801,7 +5850,7 @@ function settingsGroup(group) {
         el('div', { class: 'prefwords' }, [
           el('b', { text: 'Run history' }),
           el('p', {
-            text: `${S.history.length} run${S.history.length === 1 ? '' : 's'} held in memory. Nothing is written to disk.`
+            text: `${S.history.length} run${S.history.length === 1 ? '' : 's'} kept with the workspace — timings and status codes only, never bodies or headers.`
           })
         ]),
         el('button', {
@@ -4813,7 +5862,7 @@ function settingsGroup(group) {
             S.results.clear()
             S.previous.clear()
             commit()
-            openSettings(group)
+            openSettings()
             toast('ok', 'History cleared')
           }
         })
@@ -4834,7 +5883,7 @@ function settingsGroup(group) {
             saveSettings(safeStorage(), S.prefs)
             applyTheme()
             commit()
-            openSettings(group)
+            openSettings()
             toast('ok', 'Settings reset')
           }
         })
@@ -4874,7 +5923,7 @@ function cookieRow(group) {
             text: 'Clear',
             onclick: async () => {
               await window.prism.cookies.clear()
-              openSettings(group)
+              openSettings()
               toast('ok', 'Cookie jar emptied')
             }
           })
@@ -4916,7 +5965,7 @@ function storedRow(group) {
                 danger: 'Delete it',
                 onYes: async () => {
                   await window.prism.workspace.forget()
-                  openSettings(group)
+                  openSettings()
                   toast(
                     'ok',
                     S.prefs.autosave === false
@@ -4947,7 +5996,7 @@ function settingRow(item, group) {
           onclick: () => {
             setPref(item.id, opt.id)
             if (item.id === 'theme') applyTheme()
-            openSettings(group)
+            openSettings()
           }
         })
       )
@@ -4966,7 +6015,7 @@ function settingRow(item, group) {
           onclick: () => {
             setPref(item.id, !value)
             commit()
-            openSettings(group)
+            openSettings()
           }
         },
         [el('i')]
@@ -5000,7 +6049,7 @@ function settingRow(item, group) {
         'aria-label': item.label,
         onchange: (e) => {
           setPref(item.id, Math.min(item.max ?? Infinity, Math.max(item.min ?? 0, Number(e.target.value) || item.value)))
-          openSettings(group)
+          openSettings()
         }
       })
     )
@@ -5020,26 +6069,43 @@ function settingRow(item, group) {
 }
 
 function aboutPanel() {
-  return el('div', { class: 'doc' }, [
-    el('p', {
-      html:
-        '<strong>Rebind Prism</strong> is an open-source desktop workspace for testing an API as a <em>sequence</em> rather than one request at a time. It opens Rebind recordings and Postman collections and takes it from there.'
-    }),
-    el('h4', { text: 'What it will not do' }),
-    el('ul', {}, [
-      el('li', {
-        html: 'Put a credential in an export. A <code>{{token}}</code> comes out as an environment-variable lookup, in all fifteen targets.'
-      }),
-      el('li', {
-        html: 'Write to disk on its own. Collections, environments and history live in memory; only the settings on this page are remembered.'
-      }),
-      el('li', { html: 'Record browser traffic — it has no browser. Recordings arrive from Rebind as a file.' }),
-      el('li', { html: 'Run a Postman pre-request script. Those are read as text, never executed.' })
+  const tile = (icon, title, text) =>
+    el('div', { class: 'about-tile' }, [el('span', { class: 'empty-ico', html: ico(icon, 16, 1.9) }), el('b', { text: title }), el('span', { text })])
+  const never = (text) => el('li', {}, [el('span', { class: 'about-x', html: ico(I.x, 10, 2.6) }), el('span', { html: text })])
+
+  return el('div', { class: 'about' }, [
+    /* who this is */
+    el('section', { class: 'about-id' }, [
+      el('span', { class: 'about-mark', html: '<svg viewBox="0 0 28 28" width="34" height="34"><path d="M14 5 L23 20 H5 Z" fill="none" stroke="url(#spectrum)" stroke-width="1.9" stroke-linejoin="round" /><path d="M1 14 H10" stroke="var(--ink-3)" stroke-width="1.5" stroke-linecap="round" /><path d="M17.5 15.5 H27" stroke="var(--cyan)" stroke-width="1.3" stroke-linecap="round" /><path d="M18.5 18 H27" stroke="var(--indigo)" stroke-width="1.3" stroke-linecap="round" /><path d="M19.5 20.5 H27" stroke="var(--magenta)" stroke-width="1.3" stroke-linecap="round" /></svg>' }),
+      el('div', { class: 'about-words' }, [
+        el('div', { class: 'about-name' }, [el('b', { text: 'Prism' }), el('span', { class: 'envbadge', text: 'Version 0.1.0' })]),
+        el('p', { text: 'API testing as flows. Build requests, chain the values one captures into the next, assert on every response, and run the whole sequence here or in CI.' })
+      ])
     ]),
-    el('h4', { text: 'Licence' }),
-    el('p', {
-      html: 'MIT. No account, no licence key, no gated features — everything it does, it does for everyone.'
-    })
+
+    /* what it stands on */
+    el('div', { class: 'about-tiles' }, [
+      tile(I.folder, 'Local first', 'Your work is saved on this machine and in the .prism.json files you choose. Nothing is uploaded.'),
+      tile(I.lock, 'Secrets stay secret', 'A secret variable is never written to disk or into an export. In CI it comes from PRISM_<NAME>.'),
+      tile(I.check, 'No account', 'No sign-in, no licence key, no feature held back. Everything it does, it does for everyone.'),
+      tile(I.terminal, 'Runs in CI', 'prism-run executes the same workspace file headless, with JUnit, JSON or text output.')
+    ]),
+
+    /* the promises, stated as limits */
+    el('section', { class: 'ov-card about-card' }, [
+      el('header', { class: 'ov-card-head' }, [el('h3', { text: 'What Prism will not do' }), el('span', { text: 'Limits kept on purpose' })]),
+      el('ul', { class: 'about-never' }, [
+        never('Put a credential in an export. A <code>{{token}}</code> comes out as an environment-variable lookup in every code target.'),
+        never('Send a request to an environment named like production without asking first.'),
+        never('Run a Postman pre-request or test script. Scripts are read for their assertions and never executed.'),
+        never('Phone home. There is no telemetry and no update check; the only network traffic is the requests you send.')
+      ])
+    ]),
+
+    el('section', { class: 'ov-card about-card' }, [
+      el('header', { class: 'ov-card-head' }, [el('h3', { text: 'Licence' }), el('span', { text: 'MIT — free to use, change and share' })]),
+      el('p', { class: 'about-fine', text: 'Prism is open source under the MIT licence. Settings live in this app’s storage on this machine; your workspace lives wherever you save it.' })
+    ])
   ])
 }
 
@@ -5057,18 +6123,14 @@ const HELP = [
       el('div', { class: 'doc' }, [
         el('h4', { text: 'Bring something in' }),
         el('p', {
-          html: '<strong>Import</strong> in the bar — or dropping the file anywhere on the window — reads a Rebind workspace export, a Rebind flow, a Postman collection (v2.0 or v2.1), a Postman environment, an OpenAPI 3 or Swagger 2 document, a browser <strong>HAR</strong> capture, and a Prism workspace of its own. Everything arrives as a <strong>collection</strong>.'
+          html: '<strong>Import</strong> in the bar — or dropping the file anywhere on the window — reads a Postman collection (v2.0 or v2.1), a Postman environment, an OpenAPI 3 or Swagger 2 document, a browser <strong>HAR</strong> export, and a Prism workspace of its own. Everything arrives as a <strong>collection</strong>, with its folders as flows.'
         }),
         el('p', {
-          html: 'To get a recording out of Rebind, use <strong>Export workspace</strong> on its API page. Every other export it offers writes a suite, which throws away the captured traffic — and that traffic is the part no other tool can reproduce.'
-        }),
-        el('h4', { text: 'Turn a recording into tests' }),
-        el('p', {
-          html: 'Recorded calls arrive in the panel at the top right of the plane. Click one to turn it into a test: Prism proposes assertions from what the call actually did — its status, its content type, a field that was present, and a time budget.'
+          html: 'Or start from nothing: <strong>Ctrl&nbsp;N</strong> adds a blank request to the flow you are in, and right-clicking empty space on the plane puts one where you clicked.'
         }),
         el('div', {
           class: 'callout',
-          html: 'The budget is deliberately generous. One set to the first run&rsquo;s exact number fails on the second run, and a test that cries wolf gets deleted.'
+          html: 'Requests imported from a HAR start with assertions proposed from the response the browser saw — its status, content type, a field that was present and a generous time budget — so there is something to pass or fail from the first run.'
         }),
         el('p', {
           html: 'An OpenAPI import turns each <em>tag</em> into a flow, fills rows from the examples and enums in the document, and builds a body from the schema. The body is at zero values — empty strings, zeros — rather than plausible-looking ones, because a request that ships an invented email address to a real API is worse than an obviously blank one.'
@@ -5133,7 +6195,7 @@ const HELP = [
           }),
           el('li', { html: '<strong>Needs</strong> down the left and <strong>gives</strong> down the right.' }),
           el('li', {
-            html: 'The <strong>last result</strong> — status, time, size, assertions — or what it did when it was recorded, if it has not been run here yet.'
+            html: 'The <strong>last result</strong> — status, time and the assertion score — or <em>Not run</em> until it has been sent.'
           })
         ]),
         el('h4', { text: 'Ports and beams' }),
@@ -5149,10 +6211,14 @@ const HELP = [
         }),
         el('h4', { text: 'Moving around' }),
         el('dl', { class: 'keys' }, [
-          el('dt', { text: 'scroll' }),
-          el('dd', { text: 'Pan. A two-finger drag on a trackpad does the same.' }),
-          el('dt', { text: 'Ctrl scroll' }),
-          el('dd', { text: 'Zoom around the pointer. A trackpad pinch is the same gesture.' }),
+          el('dt', { text: 'mouse wheel' }),
+          el('dd', { text: 'Zoom around the pointer. Settings → Appearance can make it pan instead.' }),
+          el('dt', { text: 'Shift wheel' }),
+          el('dd', { text: 'Pan sideways.' }),
+          el('dt', { text: 'two fingers' }),
+          el('dd', { text: 'On a trackpad, pan. A pinch zooms.' }),
+          el('dt', { text: 'Ctrl wheel' }),
+          el('dd', { text: 'Zoom around the pointer, whatever the setting.' }),
           el('dt', { text: 'drag background' }),
           el('dd', { text: 'Pan.' }),
           el('dt', { text: 'Space drag' }),
@@ -5160,7 +6226,11 @@ const HELP = [
           el('dt', { text: 'middle drag' }),
           el('dd', { text: 'The same, for a mouse with a wheel button.' }),
           el('dt', { text: 'drag a node' }),
-          el('dd', { text: 'Move it. It then stays where you put it.' })
+          el('dd', { text: 'Move it. It then stays where you put it.' }),
+          el('dt', { text: 'double-click' }),
+          el('dd', { text: 'Open a node and put the caret in its endpoint.' }),
+          el('dt', { text: 'right-click' }),
+          el('dd', { text: 'A node’s actions, or — on empty space — new request, run, zoom and tidy.' })
         ]),
         el('p', {
           html: '<strong>Fit</strong> frames everything; <strong>Tidy</strong> lays the nodes back out in order and forgets any you moved.'
@@ -5453,6 +6523,22 @@ const HELP = [
           el('dd', { text: 'From the endpoint field, send' }),
           el('dt', { text: 'Ctrl Shift V' }),
           el('dd', { text: 'Turn a cURL command in the clipboard into a request' }),
+          el('dt', { text: 'Ctrl N' }),
+          el('dd', { text: 'New request in the current flow' }),
+          el('dt', { text: 'Ctrl D' }),
+          el('dd', { text: 'Duplicate the picked request' }),
+          el('dt', { text: 'Delete' }),
+          el('dd', { text: 'Delete the picked request, after asking' }),
+          el('dt', { text: 'F2' }),
+          el('dd', { text: 'Rename the picked request' }),
+          el('dt', { text: 'Up / Down' }),
+          el('dd', { text: 'On the plane or the tree, pick the previous or next request' }),
+          el('dt', { text: 'Ctrl = / Ctrl −' }),
+          el('dd', { text: 'Zoom the plane in or out' }),
+          el('dt', { text: 'Ctrl 0' }),
+          el('dd', { text: 'Zoom the plane to 100%' }),
+          el('dt', { text: 'Shift 1' }),
+          el('dd', { text: 'Fit everything on screen' }),
           el('dt', { text: 'Ctrl S' }),
           el('dd', { text: 'Save — writes back to the open file, and asks where only the first time' }),
           el('dt', { text: 'Ctrl Shift S' }),
@@ -5525,10 +6611,40 @@ function openHelp(section) {
   if (section) helpAt = section
   page({
     title: 'Help',
-    sections: HELP.map((h) => ({ ...h, render: h.body })),
+    sections: HELP.map((h) => ({ ...h, render: () => helpArticle(h) })),
     active: helpAt,
     onPick: (id) => openHelp(id)
   })
+}
+
+/**
+ * A help section as an article: the text in a reading column, and beside it
+ * a list of its headings that jumps to each, the way documentation reads.
+ */
+function helpArticle(h) {
+  const doc = h.body()
+  const heads = [...doc.querySelectorAll('h4')]
+  heads.forEach((head, i) => (head.id = `help-${h.id}-${i}`))
+  const at = HELP.findIndex((x) => x.id === h.id)
+  const next = HELP[at + 1]
+  const prev = HELP[at - 1]
+  const article = el('article', { class: 'help-article' }, [
+    doc,
+    el('nav', { class: 'help-pager', 'aria-label': 'More help' }, [
+      prev ? el('button', { class: 'help-step', type: 'button', onclick: () => openHelp(prev.id) }, [el('small', { text: 'Previous' }), el('b', { text: prev.label })]) : el('span'),
+      next ? el('button', { class: 'help-step next', type: 'button', onclick: () => openHelp(next.id) }, [el('small', { text: 'Next' }), el('b', { text: next.label })]) : el('span')
+    ])
+  ])
+  const toc = el('aside', { class: 'help-toc' }, [el('h4', { text: 'On this page' })])
+  for (const head of heads) {
+    toc.append(
+      el('button', { type: 'button', text: head.textContent, onclick: () => {
+        const scroll = document.querySelector('.page-help .page-scroll')
+        scroll?.scrollTo({ top: head.offsetTop - 20, behavior: 'smooth' })
+      } })
+    )
+  }
+  return el('div', { class: 'help-layout' }, [article, heads.length ? toc : null])
 }
 
 /* ================================================================ history */
@@ -5595,6 +6711,16 @@ function trendStrip(runs) {
   return box
 }
 
+/** Which runs the History table shows: every one, the failures, or the slow. */
+let historyFilter = 'all'
+
+/**
+ * History, as an activity dashboard.
+ *
+ * "All runs" first: the numbers that matter across the workspace, a timeline
+ * of every run drawn as bars, and a table to find any one of them. Then the
+ * flaky ones, then each request on its own with the same view scoped to it.
+ */
 function openHistory() {
   const byRequest = new Map()
   for (const h of S.history) {
@@ -5602,58 +6728,217 @@ function openHistory() {
     byRequest.get(h.requestId).push(h)
   }
 
-  if (!byRequest.size) {
-    page({
-      title: 'History',
-      sections: [
-        {
-          id: 'none',
-          label: 'Nothing yet',
-          icon: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-          blurb: 'Runs from this session appear here.',
-          render: () =>
-            el('p', { class: 'note', text: 'Send a request and every run of it is kept here until Prism closes. Nothing is written to disk.' })
-        }
-      ],
-      active: 'none',
-      onPick: () => {}
-    })
-    return
-  }
-
-  const ids = [...byRequest.keys()]
-  if (!byRequest.has(historyOf)) historyOf = ids[0]
-
-  const sections = ids.map((id) => {
-    const runs = byRequest.get(id)
-    const worst = runs.some((r) => r.failed)
-    return {
-      id,
-      label: runs[0].name,
-      icon: worst ? '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>' : '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-      blurb: `${runs.length} run${runs.length === 1 ? '' : 's'} · ${runs[0].method} ${shortPath(runs[0].url)}`,
-      render: () => historyFor(runs)
+  const clock = '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
+  const sections = [
+    {
+      id: 'all',
+      label: 'All runs',
+      icon: '<path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15v-4M12 15V8M16 15v-6"/>',
+      badge: S.history.length || '',
+      blurb: S.history.length ? `Every run in this workspace, newest first. ${S.history.length} kept.` : 'Every run of every request appears here.',
+      actions: () => historyActions(),
+      render: () => (S.history.length ? historyDashboard(S.history, true) : historyEmpty())
     }
-  })
+  ]
 
   const unstable = flakyRuns(S.history)
   if (unstable.length) {
-    // First in the rail, because a test that fails one run in four is the most
-    // expensive thing in the list and the easiest to never notice.
-    sections.unshift({
+    // High in the list, because a test that fails one run in four is the most
+    // expensive thing here and the easiest never to notice.
+    sections.push({
       id: 'flaky',
-      label: `Flaky (${unstable.length})`,
+      label: 'Flaky',
       icon: '<path d="M12 3 2 21h20z"/><path d="M12 9v5M12 17h.01"/>',
-      blurb: 'Requests that have both passed and failed in this workspace.',
+      badge: unstable.length,
+      tone: 'bad',
+      blurb: 'Requests that have both passed and failed, sorted by how often they fail.',
       render: () => flakyPanel(unstable)
     })
-    if (!ids.includes(historyOf) && historyOf !== 'flaky') historyOf = 'flaky'
   }
 
+  for (const [id, runs] of byRequest) {
+    const failing = runs.filter((r) => r.failed || r.status >= 400 || !r.status).length
+    sections.push({
+      id,
+      label: runs[0].name || 'Untitled',
+      icon: failing ? '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>' : clock,
+      badge: runs.length,
+      tone: failing ? 'bad' : '',
+      blurb: `${runs.length} run${runs.length === 1 ? '' : 's'} · ${runs[0].method} ${findRequest(id) ? shortPath(findRequest(id).url) : ''}`,
+      actions: () => [
+        findRequest(id)
+          ? el('button', { class: 'btn', type: 'button', text: 'Open request', onclick: () => {
+              closePage()
+              pick(id)
+              reveal(id)
+            } })
+          : null,
+        findRequest(id)
+          ? el('button', { class: 'btn go', type: 'button', html: `${ico(I.play, 10)}<span>Send again</span>`, onclick: () => send(findRequest(id)) })
+          : null
+      ].filter(Boolean),
+      render: () => historyDashboard(runs, false)
+    })
+  }
+
+  if (!sections.some((s) => s.id === historyOf)) historyOf = 'all'
   page({ title: 'History', sections, active: historyOf, onPick: (id) => {
     historyOf = id
+    historyFilter = 'all'
     openHistory()
   } })
+}
+
+function historyEmpty() {
+  return el('div', { class: 'hist-empty' }, [
+    el('span', { class: 'empty-ico', html: ico('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', 20, 1.8) }),
+    el('b', { text: 'No runs yet' }),
+    el('p', { text: 'Send a request or run a flow and every run lands here — its status and timing, never its body or headers — saved with the workspace so trends outlive the session.' }),
+    el('button', { class: 'btn go', type: 'button', html: `${ico(I.play, 10)}<span>Run the current flow</span>`, onclick: () => {
+      closePage()
+      runFlow()
+    } })
+  ])
+}
+
+function historyActions() {
+  if (!S.history.length) return []
+  return [
+    el('button', { class: 'btn', type: 'button', text: 'Clear history', onclick: async () => {
+      const yes = await ask({ title: 'Clear the run history?', blurb: `All ${S.history.length} runs are removed from this workspace. Requests and their tests are not touched.`, danger: 'Clear history', note: 'This cannot be undone.' })
+      if (!yes) return
+      S.history = []
+      commit()
+      openHistory()
+      toast('ok', 'History cleared')
+    } })
+  ]
+}
+
+const p95 = (times) => {
+  if (!times.length) return 0
+  const sorted = [...times].sort((a, b) => a - b)
+  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)]
+}
+
+const runFailed = (h) => Boolean(h.failed) || !h.status || h.status >= 400
+
+/** The numbers, the timeline and the table, for any set of runs. */
+function historyDashboard(runs, showName) {
+  const box = el('div', { class: 'hist' })
+  const times = runs.map((r) => r.ms).filter((n) => n >= 0)
+  const failed = runs.filter(runFailed).length
+  const rate = runs.length ? Math.round(((runs.length - failed) / runs.length) * 100) : 0
+
+  const kpi = (value, label, sub, tone = '') =>
+    el('div', { class: `ov-kpi${tone ? ` ${tone}` : ''}` }, [el('b', { text: value }), el('span', { text: label }), sub ? el('small', { text: sub }) : null])
+  box.append(
+    el('div', { class: 'ov-kpis hist-kpis' }, [
+      kpi(String(runs.length), 'Runs', showName ? `${new Set(runs.map((r) => r.requestId)).size} requests` : 'of this request'),
+      kpi(`${rate}%`, 'Passing', `${runs.length - failed} passed · ${failed} failed`, failed ? 'fail' : 'pass'),
+      kpi(`${median(times)} ms`, 'Median', 'half of runs were faster'),
+      kpi(`${p95(times)} ms`, 'p95', '1 in 20 runs is slower', p95(times) > 1000 ? 'fail' : ''),
+      kpi(`${Math.max(0, ...times)} ms`, 'Slowest', runs.length ? ago(runs.reduce((a, b) => (b.ms > a.ms ? b : a)).at) : '')
+    ])
+  )
+
+  // The timeline: one bar per run, oldest on the left, height is time and
+  // colour is outcome. "Is this getting slower" and "when did it start
+  // failing" are both answered by its shape, and by nothing else on screen.
+  box.append(
+    el('section', { class: 'ov-card' }, [
+      el('header', { class: 'ov-card-head' }, [
+        el('h3', { text: 'Timeline' }),
+        el('span', { text: `Last ${Math.min(runs.length, 80)} runs, oldest on the left` }),
+        el('span', { class: 'hist-legend' }, [el('i', { class: 'pass' }), document.createTextNode('passed'), el('i', { class: 'fail' }), document.createTextNode('failed')])
+      ]),
+      runChart(runs.slice(0, 80).reverse())
+    ])
+  )
+
+  /* the table, with a filter */
+  const slowMark = p95(times)
+  const shown = runs.filter((r) => (historyFilter === 'failed' ? runFailed(r) : historyFilter === 'slow' ? r.ms >= slowMark && r.ms > 0 : true))
+  const chip = (id, label, n) =>
+    el('button', { class: `chipbtn${historyFilter === id ? ' on' : ''}`, type: 'button', onclick: () => {
+      historyFilter = id
+      openHistory()
+    } }, [el('span', { text: label }), el('b', { text: String(n) })])
+  const slowest = Math.max(1, ...times)
+  const table = el('section', { class: 'ov-card' }, [
+    el('header', { class: 'ov-card-head' }, [
+      el('h3', { text: 'Runs' }),
+      el('span', { text: 'Newest first. Click one to open its request.' }),
+      el('div', { class: 'hist-filter' }, [
+        chip('all', 'All', runs.length),
+        chip('failed', 'Failed', failed),
+        chip('slow', 'Slowest 5%', runs.filter((r) => r.ms >= slowMark && r.ms > 0).length)
+      ])
+    ]),
+    el('div', { class: `run-head${showName ? ' named' : ''}` }, [
+      el('span', { text: 'When' }),
+      showName ? el('span', { text: 'Request' }) : null,
+      el('span', { text: 'Status' }),
+      el('span', { text: 'Duration' }),
+      el('span', { text: '' }),
+      el('span', { text: 'Environment' })
+    ])
+  ])
+  if (!shown.length) table.append(el('p', { class: 'ov-empty', text: 'No runs match that filter.' }))
+  for (const h of shown.slice(0, 200)) {
+    table.append(
+      el('button', { class: `run-row${showName ? ' named' : ''}${runFailed(h) ? ' bad' : ''}`, type: 'button', title: new Date(h.at).toLocaleString(), onclick: () => {
+        if (!findRequest(h.requestId)) return
+        closePage()
+        pick(h.requestId)
+        reveal(h.requestId)
+      } }, [
+        el('span', { class: 'when', text: `${new Date(h.at).toLocaleTimeString()} · ${ago(h.at)}` }),
+        showName ? el('span', { class: 'run-name' }, [el('span', { class: `verb ${String(h.method).toLowerCase()}`, text: h.method }), el('b', { text: h.name })]) : null,
+        el('span', {}, [el('span', { class: `code ${tone(h.status)}`, text: String(h.status || 'ERR') })]),
+        el('span', { class: 'run-ms', text: `${h.ms} ms` }),
+        // A bar rather than only a number: the point of a list of runs is the
+        // shape of it, and numbers in a column do not have one.
+        el('span', { class: 'run-bar' }, [el('span', { class: `run-fill${runFailed(h) ? ' bad' : h.ms >= slowMark ? ' slow' : ''}`, style: `width:${Math.max(2, (h.ms / slowest) * 100)}%` })]),
+        el('span', { class: 'run-env', text: h.env })
+      ])
+    )
+  }
+  box.append(table)
+  return box
+}
+
+/** One bar per run: height is its time, colour is its outcome. */
+function runChart(runs) {
+  const W = 1000
+  const H = 160
+  const top = Math.max(1, ...runs.map((r) => r.ms))
+  // A round number at the top of the scale, so the guide lines read cleanly.
+  const step = [50, 100, 200, 250, 500, 1000, 2000, 5000, 10000].find((s) => s * 4 >= top) ?? Math.ceil(top / 4)
+  const max = step * 4
+  // Each run gets an equal slot across the whole width, so a handful of runs
+  // fills the chart rather than huddling at its left edge.
+  // The right-hand strip is the scale's, so no bar sits under a label.
+  const plot = W - 64
+  const slot = plot / Math.max(1, runs.length)
+  const bw = Math.max(2, Math.min(56, slot * 0.68))
+  const guides = [1, 2, 3, 4]
+    .map((i) => {
+      const y = H - (i * step * H) / max
+      return `<line class="rc-guide" x1="0" x2="${W}" y1="${y}" y2="${y}"/><text class="rc-label" x="${W - 4}" y="${y + 12}">${i * step} ms</text>`
+    })
+    .join('')
+  const bars = runs
+    .map((r, i) => {
+      const h = Math.max(2, (r.ms / max) * H)
+      const x = i * slot + (slot - bw) / 2
+      const label = `${r.name} — ${r.status || 'error'} in ${r.ms} ms, ${new Date(r.at).toLocaleTimeString()}`
+      return `<rect class="rc-bar ${runFailed(r) ? 'fail' : 'pass'}" x="${x}" y="${H - h}" width="${bw}" height="${h}" rx="2"><title>${esc(label)}</title></rect>`
+    })
+    .join('')
+  const holder = el('div', { class: 'run-chart' })
+  holder.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Run times, oldest first">${guides}${bars}</svg>`
+  return holder
 }
 
 /**
@@ -5690,50 +6975,6 @@ function flakyPanel(list) {
   return box
 }
 
-function historyFor(runs) {
-  const box = el('div')
-  // The trend first: "is this getting slower" is the reason to keep old runs
-  // at all, and it is not answerable from a list of times in a column.
-  const trend = trendStrip(runs)
-  if (trend) box.append(trend)
-
-  const times = runs.map((r) => r.ms)
-  const slowest = Math.max(...times, 1)
-  const failed = runs.filter((r) => r.failed).length
-
-  box.append(
-    el('div', { class: 'tiles' }, [
-      tile('', String(runs.length), 'runs'),
-      tile(failed ? 'bad' : 'ok', `${runs.length - failed}/${runs.length}`, 'passed'),
-      tile('info', `${Math.round(times.reduce((a, b) => a + b, 0) / times.length)}`, 'ms average'),
-      tile(slowest > 1000 ? 'warn' : '', String(slowest), 'ms slowest')
-    ])
-  )
-
-  box.append(el('div', { class: 'lbl' }, [el('span', { text: 'Every run' }), el('em', { text: 'newest first' })]))
-  for (const h of runs) {
-    box.append(
-      el('button', { class: 'run-row', type: 'button', onclick: () => {
-        closeSheet()
-        pick(h.requestId)
-      } }, [
-        el('span', { class: 'when', text: new Date(h.at).toLocaleTimeString() }),
-        el('span', { class: `code ${tone(h.status)}`, text: String(h.status || 'ERR') }),
-        // A bar rather than only a number: the point of a list of runs is the
-        // shape of it, and eight numbers in a column do not have one.
-        el('span', { class: 'run-bar' }, [
-          el('span', {
-            class: `run-fill${h.ms > 1000 ? ' slow' : ''}`,
-            style: `width:${Math.max(2, (h.ms / slowest) * 100)}%`
-          })
-        ]),
-        el('span', { class: 'run-ms', text: `${h.ms} ms` }),
-        el('span', { class: 'run-env', text: h.env })
-      ])
-    )
-  }
-  return box
-}
 
 /* ============================================================== flow run */
 
@@ -5782,6 +7023,7 @@ async function runFlow(only) {
   }
 
   const flat = p.stages.flat()
+  if (!(await productionOk(`every request in ${flow.name} (${flat.length})`))) return
   const state = new Map(flat.map((r) => [r.id, { id: r.id, name: r.name, status: 'wait', ms: 0, code: 0 }]))
   const body = el('div', { class: 'suite' })
   const ring = el('div', { class: 'ring' })
@@ -5840,7 +7082,7 @@ async function runFlow(only) {
         const x = state.get(r.id)
         x.status = 'run'
         paint()
-        await send(r)
+        await send(r, { confirmed: true, quiet: true })
         const res = S.results.get(r.id)
         x.ms = res?.timing?.total ?? 0
         x.code = res?.status ?? 0
@@ -5876,6 +7118,7 @@ async function runCollection(col) {
  * measured rather than a change in the test.
  */
 async function repeatRequest(req, times = 10) {
+  if (!(await productionOk(`${req.name}, ${times} times,`))) return
   const results = []
   const body = el('div', { class: 'suite' })
   const ring = el('div', { class: 'ring' })
@@ -5980,14 +7223,46 @@ function sheet({ title, blurb, body, acts, onClose }) {
   }
 }
 
+/** A one-field question that can be awaited. Resolves '' when dismissed. */
+function promptText({ title, blurb, value = '', action = 'Save' }) {
+  return new Promise((resolve) => {
+    let answered = false
+    const input = el('input', { class: 'prompt-field', value, spellcheck: 'false', 'aria-label': title })
+    const done = () => {
+      answered = true
+      resolve(input.value.trim())
+    }
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        done()
+        closeSheet()
+      }
+    })
+    sheet({
+      title,
+      blurb,
+      body: input,
+      acts: [{ label: action, go: true, onClick: done }],
+      onClose: () => {
+        if (!answered) resolve('')
+      }
+    })
+    setTimeout(() => {
+      input.focus()
+      input.select()
+    }, 0)
+  })
+}
+
 /** A confirm that can be awaited, for a decision taken mid-flow. */
-function ask({ title, blurb, danger }) {
+function ask({ title, blurb, danger, note = 'Nothing has been sent yet.' }) {
   return new Promise((resolve) => {
     let answered = false
     sheet({
       title,
       blurb,
-      body: el('p', { class: 'note', text: 'Nothing has been sent yet.' }),
+      body: el('p', { class: 'note', text: note }),
       acts: [{ label: danger, bad: true, onClick: () => {
         answered = true
         resolve(true)
@@ -6155,45 +7430,108 @@ function openPalette() {
   veil.hidden = false
   sheetUp = true
 
-  const items = allRequests().map((r) => ({ label: r.name, sub: `${r.method} ${shortPath(r.url)}`, run: () => pick(r.id) }))
-  items.push(
-    { label: 'Import a collection', sub: 'rebind or postman', run: doImport },
-    { label: 'Export', sub: 'code or collection', run: openExport },
-    { label: 'Environments', sub: 'variables', run: () => openEnvironments() },
-    { label: 'History', sub: 'this session', run: openHistory },
-    { label: 'Run the flow', sub: 'along the graph', run: () => runFlow() },
-    { label: 'New collection', sub: 'empty', run: newCollection },
-    { label: 'Tidy the plane', sub: 'lay out in order', run: tidy },
-    { label: 'Paste a cURL command', sub: 'from a browser network tab', run: pasteCurl },
-    { label: 'Save workspace', sub: 'write it back to its file', run: saveWorkspace },
-    { label: 'Save workspace as', sub: 'write a new file to keep', run: saveWorkspaceAs },
-    { label: 'Open a workspace', sub: 'a saved .prism file', run: openWorkspace },
-    { label: 'Show the workspace file', sub: 'in the folder it was saved to', run: revealWorkspace },
-    { label: 'Discard changes and reload', sub: 'back to the last saved copy', run: revertWorkspace },
-    { label: 'Settings', sub: 'theme, sending, safety', run: () => openSettings() },
-    { label: 'Help', sub: 'how any of this works', run: () => openHelp() }
-  )
+  const requests = allRequests().map((r) => ({
+    group: 'Requests',
+    label: r.name || 'Untitled',
+    sub: shortPath(r.url),
+    verb: r.method,
+    run: () => {
+      closePage()
+      pick(r.id)
+      reveal(r.id)
+    }
+  }))
+  const cmd = (label, sub, icon, run, keys = '') => ({ group: 'Commands', label, sub, icon, run, keys })
+  const commands = [
+    cmd('Run the flow', 'along the graph', I.play, () => runFlow()),
+    cmd('New request', 'in the current flow', I.plus, () => {
+      const flow = workingFlow()
+      if (flow) {
+        closePage()
+        addRequest(flow)
+      }
+    }, 'Ctrl N'),
+    cmd('Paste a cURL command', 'from a browser network tab', I.terminal, pasteCurl, 'Ctrl Shift V'),
+    cmd('Import a collection', 'Postman, OpenAPI, HAR', I.import, doImport),
+    cmd('Export', 'code, tests or a collection', I.up, () => openExport()),
+    cmd('Overview', 'the workspace at a glance', I.home, () => openOverview()),
+    cmd('Environments', 'values for {{name}}', I.globe, () => openEnvironments()),
+    cmd('History', 'every run, with trends', I.flow, openHistory),
+    cmd('Save workspace', 'write it back to its file', I.save, saveWorkspace, 'Ctrl S'),
+    cmd('Save workspace as', 'write a new file to keep', I.copy, saveWorkspaceAs, 'Ctrl Shift S'),
+    cmd('Open a workspace', 'a saved .prism file', I.folder, openWorkspace, 'Ctrl O'),
+    cmd('Show the workspace file', 'in the folder it was saved to', I.eye, revealWorkspace),
+    cmd('Discard changes and reload', 'back to the last saved copy', I.revert, revertWorkspace),
+    cmd('Fit everything', 'frame the whole plane', I.eye, () => {
+      closePage()
+      requestAnimationFrame(fit)
+    }, 'Shift 1'),
+    cmd('Tidy the plane', 'lay the nodes out in order', I.flow, tidy),
+    cmd('Toggle the sidebar', 'more room for the plane', I.folder, () => setTreeShown($('stage').classList.contains('tree-off'))),
+    cmd('New collection', 'empty', I.plus, newCollection),
+    cmd('Switch theme', 'dark, light or the system', I.eye, () => {
+      const order = ['system', 'dark', 'light']
+      setPref('theme', order[(order.indexOf(S.prefs.theme) + 1) % order.length])
+      applyTheme()
+      toast('ok', `Theme: ${S.prefs.theme}`)
+    }),
+    cmd('Settings', 'theme, sending, safety', I.lock, () => openSettings()),
+    cmd('Help', 'how any of this works', I.alert, () => openHelp(), 'F1')
+  ]
+  const items = [...requests, ...commands]
 
   let index = 0
   let shown = items
-  const list = el('div', { class: 'pal-list' })
-  const input = el('input', { placeholder: 'Find a request, or run a command…', 'aria-label': 'Search' })
+  const list = el('div', { class: 'pal-list', role: 'listbox' })
+  const input = el('input', { placeholder: 'Search requests and commands…', 'aria-label': 'Search', spellcheck: 'false' })
+  const count = el('span', { class: 'pal-count' })
+
+  const choose = (item) => {
+    closeSheet()
+    item.run()
+  }
 
   const paint = () => {
     list.replaceChildren()
+    count.textContent = `${shown.length} result${shown.length === 1 ? '' : 's'}`
+    if (!shown.length) {
+      list.append(el('p', { class: 'pal-none', text: 'Nothing matches. Try a request name, a path, or a word like “save”.' }))
+      return
+    }
+    let group = ''
     shown.forEach((item, i) => {
+      if (item.group !== group) {
+        group = item.group
+        list.append(el('div', { class: 'pal-group', text: group }))
+      }
       list.append(
-        el('button', { class: `pal-item${i === index ? ' on' : ''}`, type: 'button', onclick: () => {
-          closeSheet()
-          item.run()
-        } }, [el('span', { text: item.label }), el('span', { class: 'sub', text: item.sub })])
+        el('button', {
+          class: `pal-item${i === index ? ' on' : ''}`,
+          type: 'button',
+          role: 'option',
+          'aria-selected': String(i === index),
+          onclick: () => choose(item),
+          onmousemove: () => {
+            if (index !== i) {
+              index = i
+              for (const [n, b] of [...list.querySelectorAll('.pal-item')].entries()) b.classList.toggle('on', n === i)
+            }
+          }
+        }, [
+          item.verb
+            ? el('span', { class: `verb ${item.verb.toLowerCase()}`, text: item.verb })
+            : el('span', { class: 'pal-ico', html: ico(item.icon, 14, 1.9) }),
+          el('span', { class: 'pal-words' }, [el('b', { text: item.label }), el('span', { text: item.sub })]),
+          item.keys ? el('kbd', { class: 'pal-keys', text: item.keys }) : null
+        ])
       )
     })
+    list.querySelector('.pal-item.on')?.scrollIntoView({ block: 'nearest' })
   }
 
   input.addEventListener('input', () => {
-    const q = input.value.toLowerCase()
-    shown = items.filter((i) => `${i.label} ${i.sub}`.toLowerCase().includes(q))
+    const q = input.value.trim().toLowerCase()
+    shown = q ? items.filter((i) => `${i.label} ${i.sub} ${i.verb ?? ''}`.toLowerCase().includes(q)) : items
     index = 0
     paint()
   })
@@ -6207,13 +7545,22 @@ function openPalette() {
       paint()
       e.preventDefault()
     } else if (e.key === 'Enter' && shown[index]) {
-      closeSheet()
-      shown[index].run()
+      choose(shown[index])
     }
   })
 
   paint()
-  veil.append(el('div', { class: 'pal' }, [input, list]))
+  veil.append(
+    el('div', { class: 'pal' }, [
+      el('div', { class: 'pal-search' }, [el('span', { class: 'pal-search-ico', html: ico(I.search, 16, 2) }), input, count]),
+      list,
+      el('footer', { class: 'pal-foot' }, [
+        el('span', {}, [el('kbd', { text: '↑' }), el('kbd', { text: '↓' }), document.createTextNode(' to move')]),
+        el('span', {}, [el('kbd', { text: '↵' }), document.createTextNode(' to open')]),
+        el('span', {}, [el('kbd', { text: 'Esc' }), document.createTextNode(' to close')])
+      ])
+    ])
+  )
   veil.onpointerdown = (e) => {
     if (e.target === veil) closeSheet()
   }
@@ -6248,6 +7595,17 @@ function wireDrop() {
   document.addEventListener('dragover', (e) => {
     if ([...e.dataTransfer.types].includes('Files')) e.preventDefault()
   })
+  // Any drop ends the drag, including one a panel handles and stops -- the
+  // dataset drop target does, and the import overlay used to stay up over
+  // the whole window afterwards. Capture phase runs before anyone can stop it.
+  document.addEventListener(
+    'drop',
+    () => {
+      depth = 0
+      zone.hidden = true
+    },
+    true
+  )
 
   document.addEventListener('drop', async (e) => {
     depth = 0
@@ -6279,36 +7637,54 @@ function wire() {
     // Flushed here, awaited, rather than relying on `beforeunload` — that
     // handler fires while the renderer is being torn down and its IPC is
     // fire-and-forget, so the last few seconds of typing were riding on a
-    // race. This path is the one people actually use.
+    // race.
     clearTimeout(saveTimer)
     await autosave({ force: true })
-    window.prism.window.close()
+    window.prism.window.closeNow()
   }
+  // Alt+F4, the taskbar, Cmd+Q: the main process holds those closes and asks
+  // here, so they get the same flush and the same question as the button.
+  let closeAsked = false
+  window.prism.window.onCloseRequested(async () => {
+    if (closeAsked) return
+    closeAsked = true
+    try {
+      await $('winClose').onclick()
+    } finally {
+      closeAsked = false
+    }
+  })
 
   $('saveBtn').onclick = () => void saveWorkspace()
   $('saveMenuBtn').onclick = (e) => openMenu(e.currentTarget, saveMenu())
+  $('wsBtn').onclick = (e) => openMenu(e.currentTarget, workspaceMenu())
   $('importBtn').onclick = doImport
   $('emptyImport').onclick = doImport
-  $('exportBtn').onclick = openExport
+  $('emptyCurl').onclick = () => pasteCurl()
+  $('emptyOpen').onclick = () => openWorkspace()
+  // Wrapped: handed the click event directly, openExport took it for a flow.
+  $('exportBtn').onclick = () => openExport()
   $('runFlowBtn').onclick = () => runFlow()
   $('envPick').onclick = () => openEnvironments()
-  $('envBtn').onclick = openEnvironments
-  $('historyBtn').onclick = openHistory
+  $('envBtn').onclick = () => togglePage('environments', () => openEnvironments())
+  $('historyBtn').onclick = () => togglePage('history', openHistory)
+  $('railExport').onclick = () => togglePage('export', () => openExport())
   $('finder').onclick = openPalette
-  $('settingsBtn').onclick = () => openSettings()
-  $('helpBtn').onclick = () => openHelp()
+  $('settingsBtn').onclick = () => togglePage('settings', () => openSettings())
+  $('helpBtn').onclick = () => togglePage('help', () => openHelp())
+  // From a page, Collections means "back to the workspace"; on the
+  // workspace, it folds the sidebar.
+  $('railHome').onclick = () => togglePage('overview', openOverview)
+  $('railTree').onclick = () => {
+    if (pageOpen) {
+      closePage()
+      setTreeShown(true)
+    } else setTreeShown($('stage').classList.contains('tree-off'))
+  }
   $('newCollectionBtn').onclick = newCollection
   $('treeFilter').oninput = (e) => {
     S.filter = e.target.value
     paintTree()
-  }
-  $('intakeHide').onclick = () => {
-    $('intake').hidden = true
-  }
-  $('intakeAll').onclick = () => {
-    const list = [...S.recorded]
-    for (const r of list) convert(r)
-    toast('ok', `${list.length} recorded calls converted`)
   }
   $('emptyNew').onclick = () => {
     if (!S.collections.length) newCollection()
@@ -6359,7 +7735,8 @@ function wire() {
     layoutPanes()
   }
 
-  $('copyBody').onclick = () => {
+  // Two separate handlers. Save used to be assigned *inside* Copy's, so the
+  // save icon did nothing at all until Copy had been clicked once.
   $('saveBody').onclick = () => {
     const req = current()
     const res = req ? S.results.get(req.id) : null
@@ -6369,8 +7746,12 @@ function wire() {
     }
     saveBody(res, req)
   }
+  $('copyBody').onclick = () => {
     const res = S.results.get(S.pickedId)
-    if (!res) return
+    if (!res || res.error) {
+      toast('bad', 'There is no response to copy yet.')
+      return
+    }
     navigator.clipboard.writeText(res.json !== undefined ? JSON.stringify(res.json, null, 2) : (res.body ?? ''))
     toast('ok', 'Response copied')
   }
@@ -6404,6 +7785,7 @@ function wire() {
   }
 
   window.addEventListener('keydown', (e) => {
+    if (planeKey(e)) return
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault()
       sheetUp ? closeSheet() : openPalette()
@@ -6417,11 +7799,11 @@ function wire() {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
       e.preventDefault()
       openWorkspace()
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && !sheetUp) {
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && !sheetUp && !pageOpen) {
       e.preventDefault()
       $('treeFilter').focus()
       $('treeFilter').select()
-    } else if (e.key === 'F2' && S.pickedId && !sheetUp) {
+    } else if (e.key === 'F2' && S.pickedId && !sheetUp && !pageOpen) {
       e.preventDefault()
       startRename(S.pickedId)
     } else if (e.key === 'F1') {
@@ -6429,6 +7811,10 @@ function wire() {
       openHelp()
     } else if (e.key === 'Escape' && sheetUp) {
       closeSheet()
+    } else if (e.key === 'Escape' && pageOpen && !document.querySelector('.menu')) {
+      // In a field, the first Escape lets go of it; the next leaves the page.
+      if (isTyping(e.target)) e.target.blur()
+      else closePage()
     } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       const req = current()
       if (req) send(req)
@@ -6436,31 +7822,55 @@ function wire() {
   })
 
   window.addEventListener('resize', drawBeams)
+
+  // A tab strip with more tabs than room scrolls sideways under the wheel,
+  // so the last tabs are reachable without a scrollbar.
+  document.addEventListener(
+    'wheel',
+    (e) => {
+      const strip = e.target.closest?.('.tabs')
+      if (!strip || strip.scrollWidth <= strip.clientWidth || e.ctrlKey) return
+      strip.scrollLeft += e.deltaY || e.deltaX
+      e.preventDefault()
+    },
+    { passive: false }
+  )
 }
 
 async function boot() {
   S.prefs = loadSettings(safeStorage())
   applyTheme()
+  try {
+    if (window.localStorage.getItem('prism.treeOff') === '1') setTreeShown(false)
+  } catch {
+    /* no storage: the sidebar starts open */
+  }
   wire()
   wirePlane()
+  wireMinimap()
 
-  // Whatever was open last time comes back. Only when there is nothing saved
-  // does Prism fall back to the worked example — showing the demo over
-  // somebody's actual work would be worse than showing nothing.
+  // Whatever was open last time comes back, including an empty workspace:
+  // it used to be read as "nothing saved" and replaced by a demo, which is
+  // how a deleted collection appeared to come back. A first start shows the
+  // ways in rather than somebody else's example.
   const restored = await restoreWorkspace()
-  if (!restored) applyImport(readCollection(JSON.stringify(demoWorkspace()), 'demo'))
 
   commit()
   booting = false
-  // Restoring is not a change. `adopt` runs `commit`, which would otherwise
-  // leave the app dirty on every start and rewrite an identical autosave.
+  // Restoring is not a change: what came back is, by definition, what the
+  // app already has stored. The worked example is not stored until it is
+  // edited, so a first look never writes anything.
+  written.auto = autoKey(serialise(S, { name: S.savedName }))
   if (restored) S.dirty = false
-  paintSaveState()
+  syncState()
+  watchEdits()
 
-  // A last save on the way out, so the three-second debounce cannot lose the
-  // final edit.
+  // A last-resort save on the way out, for a reload or a renderer teardown
+  // that did not come through the close path.
   window.addEventListener('beforeunload', () => {
-    if (S.dirty) window.prism.workspace.autosave(JSON.stringify(serialise(S, { name: S.savedName })))
+    clearTimeout(checkTimer)
+    const doc = serialise(S, { name: S.savedName })
+    if (S.prefs.autosave !== false && autoKey(doc) !== written.auto) window.prism.workspace.autosave(JSON.stringify(doc, null, 2))
   })
 }
 

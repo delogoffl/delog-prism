@@ -2,7 +2,7 @@
   "name": "rebind-prism",
   "productName": "Rebind Prism",
   "version": "0.1.0",
-  "description": "A node-graph API testing workspace. Imports Rebind recordings and Postman collections.",
+  "description": "A node-graph API testing workspace. Imports Postman collections, OpenAPI documents, HAR files and cURL.",
   "keywords": [
     "api",
     "api-testing",

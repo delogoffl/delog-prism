@@ -3,164 +3,20 @@
  *
  * Import is the first thing anyone does with Canvas, and it is the one place
  * that handles files nobody here wrote. Every case below is a file shape that
- * exists in the wild: two generations of Rebind, Postman with the URL in
- * pieces, Postman with tests as a script, and the several ways a file can be
- * wrong.
+ * exists in the wild: Postman with the URL in pieces, Postman with tests as
+ * a script, a Postman environment, and the several ways a file can be wrong.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   readCollection,
-  fromRebindTest,
-  fromRebindCall,
   fromPostman,
   postmanTests,
   countRequests,
   queryRows
 } from '../lib/collection.js'
 
-/* ------------------------------------------------------------------ Rebind */
-
-const REBIND_SUITE = {
-  id: 's1',
-  name: 'Checkout',
-  tests: [
-    {
-      id: 'at-1',
-      name: 'POST /api/login',
-      method: 'POST',
-      url: 'https://shop.test/api/login',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: '{"email":"a@b.test"}',
-      assertions: [
-        { id: 'as-1', kind: 'status', expected: '200' },
-        { id: 'as-2', kind: 'jsonExists', target: 'token' },
-        { id: 'as-3', kind: 'responseTime', expected: '1500' }
-      ],
-      extract: [{ name: 'auth_token', from: 'body', path: 'token' }]
-    }
-  ]
-}
-
-test('a Rebind suite comes in as a flow', () => {
-  const result = readCollection(JSON.stringify(REBIND_SUITE), 'checkout.json')
-  assert.equal(result.ok, true)
-  assert.equal(result.source, 'rebind-suite')
-  assert.equal(result.flows.length, 1)
-  assert.equal(result.flows[0].requests.length, 1)
-})
-
-test('the old header object becomes rows without losing any', () => {
-  const req = fromRebindTest(REBIND_SUITE.tests[0])
-  assert.deepEqual(req.headers.map((h) => h.key).sort(), ['Accept', 'Content-Type'])
-  assert.equal(req.bodyKind, 'json')
-})
-
-test('Rebind assertion kinds map onto subject and operator', () => {
-  const req = fromRebindTest(REBIND_SUITE.tests[0])
-  assert.deepEqual(
-    req.assertions.map((a) => `${a.subject}:${a.op}`),
-    ['status:equals', 'json:exists', 'time:lessThan']
-  )
-  // The path has to survive, or the assertion checks nothing.
-  assert.equal(req.assertions[1].path, 'token')
-})
-
-test('an extraction becomes a capture, so chaining still works', () => {
-  const req = fromRebindTest(REBIND_SUITE.tests[0])
-  assert.equal(req.captures.length, 1)
-  assert.equal(req.captures[0].name, 'auth_token')
-  assert.equal(req.captures[0].path, 'token')
-})
-
-test('a request with no pathParams at all does not throw', () => {
-  // The exact shape Rebind wrote before requests became editable rows.
-  const req = fromRebindTest({ url: 'https://x.test/a', method: 'GET' })
-  assert.deepEqual(req.pathParams, [])
-  assert.deepEqual(req.query, [])
-})
-
-test('a query string still in the URL is lifted into rows', () => {
-  const req = fromRebindTest({ url: 'https://x.test/a?page=2&q=a+b' })
-  assert.equal(req.url, 'https://x.test/a')
-  assert.deepEqual(
-    req.query.map((r) => [r.key, r.value]),
-    [
-      ['page', '2'],
-      ['q', 'a b']
-    ]
-  )
-})
-
-/* -------------------------------------------------------- Rebind workspace */
-
-const WORKSPACE = {
-  rebind: 'workspace',
-  project: 'Northwind',
-  calls: [
-    {
-      id: 'c1',
-      method: 'GET',
-      url: 'https://shop.test/api/users/42',
-      path: 'https://shop.test/api/users/42',
-      query: { include: 'orders' },
-      requestHeaders: { Accept: 'application/json', host: 'shop.test', 'content-length': '0' },
-      status: 200,
-      statusText: 'OK',
-      responseHeaders: { 'content-type': 'application/json' },
-      responseBody: '{"id":42}',
-      durationMs: 120,
-      responseBytes: 9,
-      contentType: 'application/json',
-      kind: 'json',
-      at: 1
-    },
-    { id: 'c2', method: 'GET', url: 'https://cdn.test/a.png', kind: 'asset', include: false, status: 200 }
-  ],
-  suites: [REBIND_SUITE],
-  environments: [{ id: 'e1', name: 'Development', values: { base_url: 'https://dev.test' } }]
-}
-
-test('a workspace brings recordings, flows and environments together', () => {
-  const result = readCollection(JSON.stringify(WORKSPACE))
-  assert.equal(result.ok, true)
-  assert.equal(result.source, 'rebind-workspace')
-  assert.equal(result.flows.length, 1)
-  assert.equal(result.environments[0].values.base_url, 'https://dev.test')
-})
-
-test('a call the operator excluded stays excluded', () => {
-  // Not merely filtered from a list — it must not arrive at all, or unticking
-  // it in Rebind meant nothing.
-  const result = readCollection(JSON.stringify(WORKSPACE))
-  assert.equal(result.recorded.length, 1)
-  assert.equal(result.recorded[0].url, 'https://shop.test/api/users/42')
-})
-
-test('browser-set headers are not replayed', () => {
-  const req = fromRebindCall(WORKSPACE.calls[0])
-  const keys = req.headers.map((h) => h.key.toLowerCase())
-  assert.ok(keys.includes('accept'))
-  // A stale content-length or host makes the resent request behave
-  // differently from the one being reproduced.
-  assert.ok(!keys.includes('host'))
-  assert.ok(!keys.includes('content-length'))
-})
-
-test('a recorded call keeps the evidence of what it did', () => {
-  const req = fromRebindCall(WORKSPACE.calls[0])
-  assert.equal(req.recorded.status, 200)
-  assert.equal(req.recorded.durationMs, 120)
-  assert.equal(req.recorded.responseBody, '{"id":42}')
-})
-
-test('a captured credential scheme becomes a variable, never a value', () => {
-  const req = fromRebindCall({ ...WORKSPACE.calls[0], authScheme: 'Bearer' })
-  assert.equal(req.auth.kind, 'bearer')
-  assert.equal(req.auth.token, '{{auth_token}}')
-})
-
-/* ---------------------------------------------------------------- Postman */
+/* ----------------------------------------------------------------- Postman */
 
 const POSTMAN = {
   info: { name: 'Shop API', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
@@ -321,95 +177,34 @@ test('a malformed escape in a query string does not throw', () => {
   )
 })
 
-/* ------------------------------------------------------------ round trip */
-
-/**
- * The bundle Rebind's "Export workspace" writes.
- *
- * Rebind migrates its suites to the current request shape on the way out, so
- * this is the *new* spelling — rows rather than a headers object. The old
- * spelling is covered above; both have to work, because a file exported today
- * and a file exported six months ago are both files someone will open.
- */
-const REBIND_BUNDLE = {
-  rebind: 'workspace',
-  version: 1,
-  project: 'Northwind',
-  exportedAt: '2026-08-23T10:00:00.000Z',
-  calls: [
-    {
-      id: 'c1',
-      at: 1,
-      method: 'POST',
-      url: 'https://shop.test/api/login',
-      path: 'https://shop.test/api/login',
-      query: {},
-      requestHeaders: { 'Content-Type': 'application/json' },
-      requestBody: '{"email":"a@b.test"}',
-      status: 200,
-      statusText: 'OK',
-      responseHeaders: { 'content-type': 'application/json' },
-      responseBody: '{"token":"«redacted»"}',
-      durationMs: 88,
-      requestBytes: 20,
-      responseBytes: 24,
-      contentType: 'application/json',
-      kind: 'json'
-    }
-  ],
-  suites: [
-    {
-      id: 's1',
-      name: 'Checkout',
-      tests: [
-        {
-          id: 'at-1',
-          name: 'Get user',
-          method: 'GET',
-          url: 'https://shop.test/api/users/:id',
-          query: [{ id: 'k1', key: 'include', value: 'orders', enabled: true }],
-          pathParams: [{ id: 'k2', key: 'id', value: '42' }],
-          headers: [{ id: 'k3', key: 'Accept', value: 'application/json' }],
-          auth: { kind: 'bearer', token: '{{auth_token}}' },
-          bodyKind: 'none',
-          assertions: [{ id: 'a1', kind: 'status', expected: '200' }],
-          extract: []
-        }
-      ]
-    }
-  ],
-  environments: [{ id: 'e1', name: 'Development', values: { base_url: 'https://dev.test' } }]
-}
-
-test('the workspace Rebind exports is the workspace Canvas opens', () => {
-  const result = readCollection(JSON.stringify(REBIND_BUNDLE), 'northwind-workspace.json')
-  assert.equal(result.ok, true, result.error)
-  assert.equal(result.source, 'rebind-workspace')
-  assert.equal(result.name, 'Northwind')
-  assert.equal(result.flows.length, 1)
-  assert.equal(result.recorded.length, 1)
-  assert.equal(result.environments.length, 1)
+test('Postman auth set on the collection and on a folder is inherited, not dropped', () => {
+  const doc = {
+    info: { name: 'Shop', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+    auth: { type: 'bearer', bearer: [{ key: 'token', value: '{{token}}' }] },
+    item: [
+      {
+        name: 'Admin',
+        auth: { type: 'basic', basic: [{ key: 'username', value: 'root' }] },
+        item: [{ name: 'Purge', request: { method: 'DELETE', url: 'https://x/purge' } }]
+      },
+      { name: 'Public', item: [{ name: 'Ping', request: { method: 'GET', url: 'https://x/ping', auth: { type: 'noauth' } } }] },
+      { name: 'Me', request: { method: 'GET', url: 'https://x/me' } }
+    ]
+  }
+  const out = readCollection(JSON.stringify(doc), 'shop.json')
+  assert.equal(out.ok, true)
+  const col = out.collection
+  assert.equal(col.auth.kind, 'bearer')
+  const flow = (name) => col.flows.find((f) => f.name === name)
+  assert.equal(flow('Admin').auth.kind, 'basic')
+  assert.equal(flow('Admin').requests[0].auth.kind, 'inherit')
+  assert.equal(flow('Public').requests[0].auth.kind, 'none', 'noauth is an explicit none')
+  assert.equal(flow('Ungrouped').requests[0].auth.kind, 'inherit')
 })
 
-test('rows written by Rebind arrive as rows, not as an empty list', () => {
-  // The two spellings differ in exactly this: an object versus an array of
-  // {key, value}. Reading only one of them loses every parameter silently.
-  const [flow] = readCollection(JSON.stringify(REBIND_BUNDLE)).flows
-  const [req] = flow.requests
-  assert.deepEqual(req.query.map((r) => [r.key, r.value]), [['include', 'orders']])
-  assert.deepEqual(req.pathParams.map((r) => [r.key, r.value]), [['id', '42']])
-  assert.deepEqual(req.headers.map((r) => r.key), ['Accept'])
-  assert.equal(req.auth.kind, 'bearer')
-})
-
-test('a redacted body stays redacted — Canvas does not try to recover it', () => {
-  const { recorded } = readCollection(JSON.stringify(REBIND_BUNDLE))
-  assert.match(recorded[0].recorded.responseBody, /«redacted»/)
-})
-
-test('the round trip survives a bundle with nothing in it', () => {
-  // A project where recording was never switched on.
-  const result = readCollection(JSON.stringify({ rebind: 'workspace', project: 'Empty', calls: [], suites: [], environments: [] }))
-  assert.equal(result.ok, true)
-  assert.equal(countRequests(result), 0)
+test('a Rebind export is no longer a format Prism reads', () => {
+  // Prism is an API testing tool; it does not take in recordings.
+  const result = readCollection(JSON.stringify({ rebind: 'workspace', calls: [], suites: [] }), 'rebind.json')
+  assert.equal(result.ok, false)
+  assert.doesNotMatch(result.error, /Rebind/)
 })

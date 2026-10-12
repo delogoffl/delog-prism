@@ -231,7 +231,8 @@ test('focus is always visible', () => {
     '.pal input:focus': '.pal',
     '.bench-grip:focus-visible': '.bench-grip:focus-visible span',
     '.tree-filter input:focus': '.tree-filter:focus-within',
-    '.find-field:focus': '.find-bar-row:focus-within'
+    '.find-field:focus': '.find-bar-row:focus-within',
+    '.set-search:focus': '.set-find:focus-within'
   }
 
   for (const m of CSS.matchAll(/([^\n{}]+)\{([^}]*outline:\s*(?:none|0)\b[^}]*)\}/g)) {

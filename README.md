@@ -1,9 +1,9 @@
-# Rebind Prism
+# Prism
 
-A workflow-first API testing workspace. An open-source desktop application in
-its own right — it shares no code with Rebind and does not need Rebind
-installed. It reads Rebind's exports and Postman collections and takes it from
-there.
+A workflow-first API testing workspace. Build requests, chain the values one
+captures into the next, assert on every response, and run the whole sequence
+on your desktop or in CI. It imports Postman collections, OpenAPI documents,
+HAR files and cURL commands, and takes it from there.
 
 MIT licensed. No account, no licence key, no gated features: everything the app
 does, it does for everyone.
@@ -16,7 +16,7 @@ npm start
 ```
 
 ```bash
-npm test          # 399 tests. No Electron, no browser, no display needed.
+npm test          # 483 tests. No Electron, no browser, no display needed.
 npm run dist      # installers for the current platform
 
 # and in CI
@@ -32,13 +32,32 @@ CI needs nothing but `actions/setup-node`.
 
 ## Collections, flows, requests
 
-Three levels, because that is what a Postman file and a Rebind export both
-actually are. Flattening them lost where a flow came from and made a re-export
+Three levels, because that is what a Postman file and an OpenAPI document
+both actually are. Flattening them lost where a flow came from and made a re-export
 produce a file shaped differently from the one you opened.
 
 Every level can be created, and every level can be deleted — with a dialog that
 says what goes with it, because deleting a flow takes its requests and a count
 is the difference between a decision and a surprise.
+
+## The layout
+
+Four columns under a command bar, and a status line below:
+
+- **Rail** — Collections (folds the sidebar away for a bigger plane),
+  Environments, History, and Help and Settings at the foot. Each icon names
+  itself on hover.
+- **Collections** — the three-level tree, with a filter.
+- **Plane** — the requests and the values travelling between them. Each
+  flow sits in a lane with its name, its last result and a Run button; a
+  minimap in the corner shows the whole plane and moves you around it; one
+  floating toolbar holds zoom, fit and tidy.
+- **Inspector** — the picked request: endpoint, request tabs, response tabs.
+
+The bar holds the command finder (Ctrl K), the environment, Save, Import and
+Export, and **Run flow** — the one accent-coloured button. The status line says
+whether the work is saved and where, how much is in the workspace, and which
+environment it runs against.
 
 ## Why it is not laid out like an API client
 
@@ -86,8 +105,7 @@ exactly where you put it.
   kind, how many query, path and header rows ride along, and the host when that
   is a literal
 - **Needs** and **gives**
-- The **last result** — status, time, size, assertions — or, if it has not been
-  run here yet, what it did *when it was recorded*
+- The **last result** — status, time and the assertion score — or *Not run*
 
 ### The colour system
 
@@ -129,8 +147,9 @@ fails the build if a setting names a home that does not exist.
 | **Safety** | Confirm before sending to production; mask credentials in the inspector |
 | **Data** | History length; clear history; reset preferences |
 
-Only these persist. Collections, environments, results and history live in
-memory and are gone when Prism closes.
+These are per-machine preferences. Your work itself — collections,
+environments, layout, baselines and run history — is kept separately; see
+*Your work is kept* below. The certificate passphrase is never written.
 
 ## Help
 
@@ -245,8 +264,6 @@ front door, so what works one way works the other.
 
 | File | What Prism does with it |
 | --- | --- |
-| Rebind **workspace** export | A collection, with its recorded calls and environments |
-| Rebind **flow** export (a suite) | One flow |
 | **Postman** collection v2.1 / v2.0 | Folders become flows; auth, query rows and test scripts come across |
 | **Postman** environment | Just the variables |
 | **OpenAPI** 3 / Swagger 2 | Tags become flows; examples and enums fill the rows |
@@ -254,25 +271,10 @@ front door, so what works one way works the other.
 | **HAR** capture | Assets and duplicates dropped, the shared host becomes a variable |
 | **cURL** command | Pasted from the clipboard with <kbd>Ctrl Shift V</kbd> |
 
-Two generations of the Rebind request shape are read, because a file exported
-today and one exported six months ago are both files somebody will open.
-
 Postman test scripts are JavaScript, so Prism reads the handful of shapes that
 make up most real scripts and **leaves the rest**. A collection that imports
 with two of its five checks is honest; one that imports with five checks it does
 not actually perform is not.
-
-### Getting the recording out of Rebind
-
-Prism and Rebind are separate programs that meet at a file, and nowhere else.
-Rebind's API page has **Export workspace** beside Run collection; every other
-export it offers writes a suite, which is enough to run elsewhere but throws
-away the captured traffic — and that traffic is the part no other tool can
-reproduce. The bundle it writes is what Prism opens.
-
-Prism never reads Rebind's database, imports its modules, or requires it to be
-installed. If you have a bundle, Prism will open it; if you have a Postman
-collection instead, that works just as well.
 
 ---
 
@@ -331,7 +333,7 @@ rebind-prism/
   main.cjs          window, HTTP with phase timings, file dialogs
   preload.cjs       the entire surface the page can touch
   lib/              pure, all of it directly tested
-    collection.js     import: Rebind (both shapes) and Postman
+    collection.js     import: Postman, and the front door for every format
     request.js        request as edited -> request as sent
     assert.js         assertions and what they saw
     insights.js       the rules over a response
@@ -354,9 +356,8 @@ assertion passed, what changed since last time, what lands in an exported file
 
 ## Deliberately not built
 
-- **Replay.** Excluded by request; that is Rebind's job.
-- **Network recording.** Prism has no browser to record. It receives
-  recordings from Rebind, which is the round trip described above.
+- **Recording.** Prism is an API testing tool, not a traffic recorder. A
+  browser's network tab can export a HAR file, and Prism imports that.
 - **Postman pre-request scripts.** Read as text, not executed.
 - **Performance analytics across runs.** History holds a session; there is no
   P95 or latency heatmap yet, because there is nothing durable to compute one

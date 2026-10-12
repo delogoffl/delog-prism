@@ -21,6 +21,7 @@ import { compile } from './lib/request.js'
 import { runAll, jsonPath } from './lib/assert.js'
 import { Jar } from './lib/cookies.js'
 import { scopeFor, labelFor } from './lib/dataset.js'
+import { withInherited } from './lib/inherit.js'
 
 /* ------------------------------------------------------------------- args */
 
@@ -221,8 +222,10 @@ async function main() {
     if (!base[name]) base[name] = value
   }
 
+  // Each flow keeps its collection, so headers and auth set higher up reach
+  // the request exactly as they do in the app.
   const flows = ws.collections
-    .flatMap((c) => c.flows)
+    .flatMap((c) => c.flows.map((f) => Object.assign(f, { collection: c })))
     .filter((f) => f.requests.length && (!opts.flow || f.name.toLowerCase() === opts.flow.toLowerCase()))
 
   if (!flows.length) {
@@ -246,7 +249,7 @@ async function main() {
       for (let i = 0; i < rows.length; i += 1) {
         const label = rows[i] ? `${req.name} [${labelFor(rows[i], i)}]` : req.name
         const scope = rows[i] ? scopeFor(vars, rows[i]) : vars
-        const out = await runRequest(req, scope, jar, opts, label)
+        const out = await runRequest(withInherited(req, [flow.collection, flow]), scope, jar, opts, label)
         results.push(out)
         if (out.failed) report.failed += 1
         else report.passed += 1

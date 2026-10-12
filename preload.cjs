@@ -13,6 +13,15 @@ contextBridge.exposeInMainWorld('prism', {
     maximize: () => ipcRenderer.invoke('window:maximize'),
     close: () => ipcRenderer.invoke('window:close'),
     isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
+    /** Told when the window is asked to close by any route, not only the button. */
+    onCloseRequested: (fn) => {
+      const handler = () => fn()
+      ipcRenderer.on('window:closeRequested', handler)
+      ipcRenderer.invoke('window:ready')
+      return () => ipcRenderer.off('window:closeRequested', handler)
+    },
+    /** Closes for real, once the page has saved what it needs to. */
+    closeNow: () => ipcRenderer.invoke('window:closeNow'),
     onState: (fn) => {
       const handler = (_e, state) => fn(state)
       ipcRenderer.on('window:state', handler)
@@ -26,6 +35,8 @@ contextBridge.exposeInMainWorld('prism', {
   },
   workspace: {
     autosave: (text) => ipcRenderer.invoke('workspace:autosave', text),
+    /** Opens a .prism.json as the document, so Save writes back to it. */
+    open: () => ipcRenderer.invoke('workspace:open'),
     restore: () => ipcRenderer.invoke('workspace:restore'),
     forget: () => ipcRenderer.invoke('workspace:forget'),
     saveAs: (payload) => ipcRenderer.invoke('workspace:saveAs', payload),

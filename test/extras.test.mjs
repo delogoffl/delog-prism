@@ -288,3 +288,18 @@ test('two different 2xx statuses are not instability', () => {
   const v = repeatVerdict([{ status: 200, failed: 0, ms: 1 }, { status: 200, failed: 0, ms: 1 }])
   assert.equal(v.flaky, false)
 })
+
+test('an exported cURL has exactly one continuation per line', async () => {
+  const { generate } = await import('../lib/codegen.js')
+  const out = generate('curl', { request: { name: 'A', method: 'GET', url: 'https://x/a', headers: [], query: [], pathParams: [], auth: { kind: 'none' }, bodyKind: 'none', body: '' } })
+  assert.doesNotMatch(out, /\\ \\/, 'a doubled backslash breaks the pasted command')
+  assert.match(out, /curl --request GET \\\n  --url/)
+})
+
+test('a whole flow exports to a code target as every request, not a placeholder', async () => {
+  const { generate } = await import('../lib/codegen.js')
+  const r = (name) => ({ name, method: 'GET', url: `https://x/${name}`, headers: [], query: [], pathParams: [], auth: { kind: 'none' }, bodyKind: 'none', body: '' })
+  const out = generate('curl', { request: null, flow: { name: 'F', requests: [r('one'), r('two')] } })
+  assert.doesNotMatch(out, /Pick a request/)
+  assert.match(out, /# one[\s\S]*https:\/\/x\/one[\s\S]*# two[\s\S]*https:\/\/x\/two/)
+})

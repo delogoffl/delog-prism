@@ -1,5 +1,5 @@
 /**
- * Rebind Prism — main process.
+ * Prism — main process.
  *
  * Three jobs and no more: own the window, send HTTP requests the renderer is
  * not allowed to send itself, and read or write files the user picks.
@@ -8,7 +8,7 @@
  * is one of the handlers below. That is the whole security model: if it is not
  * in this file, the page cannot do it.
  */
-const { app, BrowserWindow, dialog, ipcMain, protocol, net, screen, shell } = require('electron')
+const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, screen, shell } = require('electron')
 const { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync } = require('node:fs')
 // Electron already exports a `net`; this is the socket one.
 const sockets = require('node:net')
@@ -114,10 +114,39 @@ function createWindow() {
   const push = () => win?.webContents.send('window:state', { maximized: win?.isMaximized() ?? false })
   win.on('maximize', push)
   win.on('unmaximize', push)
+
+  /**
+   * Every way of closing goes through the page first.
+   *
+   * Only the in-app close button used to flush the autosave and ask about the
+   * open file. Alt+F4, the taskbar, Cmd+Q and a system shutdown all went
+   * straight past it, and the last few seconds of edits -- plus any unsaved
+   * file changes -- went with them. So the close is held, the page is asked,
+   * and it answers with `window:closeNow` once it has saved or been told not
+   * to. A page that has crashed or never started cannot answer, and must not
+   * be able to keep the window open.
+   */
+  closing = false
+  win.on('close', (e) => {
+    if (closing || !win || !pageReady || win.webContents.isCrashed()) return
+    e.preventDefault()
+    win.webContents.send('window:closeRequested')
+  })
+  win.webContents.on('render-process-gone', () => {
+    pageReady = false
+  })
+  win.webContents.on('did-start-loading', () => {
+    pageReady = false
+  })
   win.on('closed', () => {
     win = null
   })
 }
+
+/** Set once the page has said it can answer a close; cleared on reload. */
+let pageReady = false
+/** Set once the page has finished with a close, so the next one goes through. */
+let closing = false
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -168,8 +197,11 @@ function lastFile() {
     if (!existsSync(sessionPath())) return ''
     const held = JSON.parse(readFileSync(sessionPath(), 'utf8'))
     const path = String(held?.filePath ?? '')
-    // A file that has been moved or deleted is not a file to offer back.
-    return path && existsSync(path) ? path : ''
+    // A file that has been moved or deleted is not a file to offer back -- and
+    // neither is one that is not a workspace. Older builds remembered imported
+    // collections and datasets here, and handing one back made Save overwrite it.
+    if (!path || !existsSync(path)) return ''
+    return isWorkspaceText(readFileSync(path, 'utf8')) ? path : ''
   } catch {
     return ''
   }
@@ -204,6 +236,20 @@ app.whenReady().then(() => {
     }
   })
 
+  // The application menu, without View > Zoom. Electron's default binds
+  // Ctrl+=, Ctrl+- and Ctrl+0 to zooming the *whole interface*, so those keys
+  // never reached the plane and scaled the sidebar and inspector instead.
+  // The Edit menu stays: on macOS it is what makes Cmd+C and Cmd+V work.
+  const isMac = process.platform === 'darwin'
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      ...(isMac ? [{ role: 'appMenu' }] : []),
+      { role: 'editMenu' },
+      { label: 'View', submenu: [{ role: 'reload' }, { role: 'forceReload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
+      { role: 'windowMenu' }
+    ])
+  )
+
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -219,6 +265,13 @@ app.on('window-all-closed', () => {
 ipcMain.handle('window:minimize', () => win?.minimize())
 ipcMain.handle('window:maximize', () => (win?.isMaximized() ? win.unmaximize() : win?.maximize()))
 ipcMain.handle('window:close', () => win?.close())
+ipcMain.handle('window:ready', () => {
+  pageReady = true
+})
+ipcMain.handle('window:closeNow', () => {
+  closing = true
+  win?.close()
+})
 ipcMain.handle('window:isMaximized', () => win?.isMaximized() ?? false)
 
 /* -------------------------------------------------------------------- files */
@@ -238,6 +291,15 @@ ipcMain.handle('window:isMaximized', () => win?.isMaximized() ?? false)
  */
 const chosenPaths = new Set()
 
+/**
+ * Reads a file for Import, or for a dataset. Never makes it the open document.
+ *
+ * This handler used to record every file it opened as the workspace being
+ * edited. Import a Postman collection, restart, and Prism came back believing
+ * that collection was the open file, announced it had unsaved changes, and
+ * Ctrl+S overwrote it with a Prism workspace. Only `workspace:open` may do
+ * that now, and only for a file that is a workspace.
+ */
 ipcMain.handle('file:open', async (_e, filters) => {
   if (!win) return null
   const res = await dialog.showOpenDialog(win, {
@@ -247,19 +309,25 @@ ipcMain.handle('file:open', async (_e, filters) => {
   })
   if (res.canceled || !res.filePaths[0]) return null
   const path = res.filePaths[0]
-  chosenPaths.add(path)
-  rememberFile(path)
   // Read as text and handed over as text: parsing is the renderer's problem,
   // and a malformed file should surface as a readable error there rather than
   // as an exception in the process that owns the window.
-  return { path, name: basename(path), text: readFileSync(path, 'utf8') }
+  try {
+    return { path, name: basename(path), text: readFileSync(path, 'utf8') }
+  } catch (err) {
+    return { error: `Cannot read ${basename(path)} — ${err.message}` }
+  }
 })
 
 ipcMain.handle('file:save', async (_e, { name, text, filters }) => {
   if (!win) return null
   const res = await dialog.showSaveDialog(win, { title: 'Export', defaultPath: name, filters })
   if (res.canceled || !res.filePath) return null
-  writeFileSync(res.filePath, text, 'utf8')
+  try {
+    writeFileSync(res.filePath, text, 'utf8')
+  } catch (err) {
+    return { error: err.message }
+  }
   return res.filePath
 })
 
@@ -329,6 +397,46 @@ ipcMain.handle('workspace:forget', () => {
     return false
   }
 })
+
+/**
+ * Opens a saved workspace as the document being edited.
+ *
+ * The file is checked here before it is remembered, so only a genuine Prism
+ * workspace can ever become the target of a dialog-free Save.
+ */
+ipcMain.handle('workspace:open', async () => {
+  if (!win) return null
+  const res = await dialog.showOpenDialog(win, {
+    title: 'Open workspace',
+    properties: ['openFile'],
+    filters: [
+      { name: 'Prism workspace', extensions: ['json'] },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  })
+  if (res.canceled || !res.filePaths[0]) return null
+  const path = res.filePaths[0]
+  let text
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (err) {
+    return { error: `Cannot read ${basename(path)} — ${err.message}` }
+  }
+  // Handed back unremembered, so the page can explain and offer Import.
+  if (!isWorkspaceText(text)) return { path, name: basename(path), text, workspace: false }
+  chosenPaths.add(path)
+  rememberFile(path)
+  return { path, name: basename(path), text, workspace: true }
+})
+
+/** Whether some text is a Prism workspace, without trusting anything else in it. */
+function isWorkspaceText(text) {
+  try {
+    return JSON.parse(String(text))?.prism === 'prism.workspace'
+  } catch {
+    return false
+  }
+}
 
 ipcMain.handle('workspace:saveAs', async (_e, { name, text }) => {
   if (!win) return null
