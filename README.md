@@ -285,9 +285,14 @@ Everything below is wired end to end, not mocked:
 - **Sending**, from the main process, with real DNS / TCP / TLS / wait /
   download phase timings taken from Node's own socket events. Anything measured
   in the renderer would be one number with a guess split across it.
-- **Assertions** — seven subjects × their operators, each reporting what it
-  actually saw. A red row that will not say what it found is a row people
-  delete.
+- **Assertions** — eleven subjects (status, time, size, content type,
+  headers, body, JSON paths, JSON Schema, cookies, redirects, transport) and
+  over forty operators, each reporting what it actually saw. JSON paths take
+  `[*]` wildcards with every-item semantics, `[-1]` and a leading `$.`;
+  formats cover email, UUID, ISO dates, URLs, IPs, JWTs and semver. A
+  **library** of 55 ready-made checks and a **generator** that proposes a suite
+  from a real response — types, formats and shape rather than today's values,
+  each checked against that response before it is offered.
 - **Chaining.** A captured value lands in the environment, so the next request
   in the flow uses it without anyone copying anything.
 - **Insights** — see below.

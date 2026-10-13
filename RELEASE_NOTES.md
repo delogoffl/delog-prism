@@ -1,5 +1,51 @@
 # Unreleased — redesign and save fixes
 
+## A new look
+
+- **Floating workspace.** The collections, the canvas and the inspector are
+  rounded panels floating over an aurora backdrop, and the icon rail is a
+  dock with every place named under its icon. Pages use the same panels.
+- **The canvas, redrawn.** Nodes take their method's hue across the header
+  and along the top edge, carry the endpoint in an inset well, and send with
+  a round accent button. A picked node glows; a running one has a light that
+  travels round its edge. Wires glow, and the ones touching the picked or
+  running request animate in the direction the value travels. Flows sit in
+  dashed lanes tinted by how they last ran.
+- **Suite health** at the foot of the sidebar: how many requests passed their
+  last run, and Run all.
+- **Inter and JetBrains Mono are bundled** (SIL Open Font License, in
+  `renderer/fonts`), so the app looks the same on every machine.
+- **A new design system.** Deeper, layered surfaces lit from the top edge, a
+  violet accent with a soft glow on the one primary action, and display type
+  for headings. Every method has its own hue — GET, POST, PUT, PATCH and
+  DELETE read the same in the tree, on the plane, in the inspector and in the
+  palette. Dark and light were both redrawn, and both pass the contrast rules.
+- **The stylesheet was rewritten** as one layer per surface instead of a base
+  plus override layers, so a rule means what it says where it is written.
+- Nodes carry a hairline under the footer that fills with the share of
+  assertions that passed. The Tests tab's count turns green or red with the
+  last run.
+
+## Assertions, rebuilt
+
+- **Eleven subjects and over forty operators.** New: JSON Schema, cookies
+  (value and flags), redirects and transport. JSON paths gain `[*]` wildcards
+  that check every item, `[-1]`, a leading `$.`, formats (email, UUID, ISO
+  date and date-time, URL, IPv4/6, JWT, semver and more), ranges, one-of
+  lists, sorted, unique, null, true and false.
+- **The Tests tab is a studio.** A score ring, then each assertion as two
+  readable lines — what is checked, and how — with what the last response
+  said underneath. Values from a fixed list (types, formats, classes, flags)
+  are picked, not typed.
+- **Generate** proposes a suite read off the last response — types, formats
+  and shape rather than today's values — and every suggestion is checked
+  against that response before it is offered.
+- **The library** holds 55 ready-made checks across status codes,
+  performance, headers, body, JSON fields, schema and security headers.
+- **The Result tab is a report**: failures first, each written as the
+  sentence it checks and what was seen. Response headers and body values
+  offer one-click assertions on their type and format as well as their value.
+
 ## Saving, fixed
 
 - **Import no longer hijacks Save.** Importing a Postman collection, a HAR or a

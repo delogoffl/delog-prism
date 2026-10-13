@@ -34,7 +34,25 @@ import {
   countRequests
 } from '../lib/collection.js'
 import { compile, buildUrl, variablesUsed, interpolate } from '../lib/request.js'
-import { runAll, emptyAssertion, SUBJECTS, OPERATORS, OP_LABEL, suggestFor, jsonPath } from '../lib/assert.js'
+import {
+  runAll,
+  check,
+  emptyAssertion,
+  SUBJECTS,
+  OPERATORS,
+  OP_LABEL,
+  OP_META,
+  TYPES,
+  FORMATS,
+  CATALOG,
+  needsValue,
+  needsPath,
+  describe,
+  generate as suggestTests,
+  inferSchema,
+  suggestFor,
+  jsonPath
+} from '../lib/assert.js'
 import { analyse, bytes as fmtBytes } from '../lib/insights.js'
 import { tree, diff, diffSummary } from '../lib/schema.js'
 import { TARGETS, GROUPS, WHOLE_FLOW, generate, slug } from '../lib/codegen.js'
@@ -101,7 +119,10 @@ const I = {
   search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
   // A floppy disk, still the only glyph everyone reads as "save".
   save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
-  revert: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>'
+  revert: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>',
+  sparkle: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><path d="m6.3 6.3 2.1 2.1M15.6 15.6l2.1 2.1M6.3 17.7l2.1-2.1M15.6 8.4l2.1-2.1"/>',
+  library: '<path d="M4 19V5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v14"/><path d="M9 19V8a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v11"/><path d="m14.5 8.6 2.9-.8a1 1 0 0 1 1.2.7l2.6 9.7"/><path d="M3 19h18"/>',
+  shield: '<path d="M12 3 5 6v6c0 4.4 3 7.6 7 9 4-1.4 7-4.6 7-9V6z"/><path d="m9 12 2 2 4-4"/>'
 }
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n))
@@ -819,6 +840,7 @@ function setTreeShown(shown) {
 let renaming = ''
 
 function paintTree() {
+  paintTreeFoot()
   const host = $('treeBody')
   host.replaceChildren()
 
@@ -925,6 +947,34 @@ function paintTree() {
   if (q && !shown) {
     host.append(el('p', { class: 'tree-nothing', text: `Nothing matches “${S.filter}”.` }))
   }
+}
+
+/**
+ * The suite's health at the foot of the sidebar: how many requests passed
+ * their last run, and the button that runs every flow. The question every
+ * session starts with, answered without opening a page.
+ */
+function paintTreeFoot() {
+  const host = $('treeFoot')
+  if (!host) return
+  host.replaceChildren()
+  const requests = allRequests()
+  if (!requests.length) return
+  const ran = requests.map((r) => S.results.get(r.id)).filter(Boolean)
+  const ok = ran.filter((r) => !r.error && !r.failed).length
+  const checks = ran.reduce((n, r) => n + (r.checks?.length ?? 0), 0)
+  const busy = S.busy.size > 0
+  const state = busy || !ran.length ? 'idle' : ok === ran.length ? 'pass' : 'fail'
+  host.append(
+    el('div', { class: `health ${state}` }, [
+      scoreRing(ok, ran.length || requests.length, state, 40),
+      el('div', { class: 'health-words' }, [
+        el('b', { text: busy ? 'Running…' : !ran.length ? 'Not run yet' : ok === ran.length ? 'All passing' : `${ran.length - ok} failing` }),
+        el('span', { text: ran.length ? `${ok}/${ran.length} requests · ${checks} checks` : `${requests.length} requests to run` })
+      ]),
+      el('button', { class: 'btn go', type: 'button', title: 'Run every flow', disabled: busy, html: `${ico(I.play, 10)}<span>Run all</span>`, onclick: () => runEveryFlow() })
+    ])
+  )
 }
 
 /**
@@ -1549,6 +1599,7 @@ function nodeFor(req) {
     class: `node${req.id === S.pickedId ? ' on' : ''}${S.busy.has(req.id) ? ' busy' : ''}`,
     style: `left:${at.x}px;top:${at.y}px`,
     'data-id': req.id,
+    'data-verb': verb,
     'data-outcome': outcome,
     tabindex: '0',
     role: 'button',
@@ -1641,6 +1692,17 @@ function nodeFor(req) {
       }
     })
   )
+  // A hairline along the foot that fills with the share of checks that
+  // passed, so a half-green suite reads as half-green from across the plane.
+  if (res && !res.error && res.checks?.length) {
+    const ok = res.checks.length - res.failed
+    foot.append(
+      el('span', { class: 'node-meter', 'aria-hidden': 'true' }, [
+        el('i', { style: `width:${(ok / res.checks.length) * 100}%` }),
+        res.failed ? el('i', { class: 'bad', style: `width:${(res.failed / res.checks.length) * 100}%` }) : null
+      ])
+    )
+  }
   node.append(foot)
 
   node.addEventListener('pointerdown', (e) => drag(e, req, node))
@@ -1817,10 +1879,22 @@ function drawBeams() {
     path.setAttribute('d', `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`)
     path.setAttribute('fill', 'none')
     path.setAttribute('stroke', 'url(#beamgrad)')
-    path.setAttribute('stroke-width', '1.5')
+    path.setAttribute('stroke-width', '2')
     path.setAttribute('stroke-opacity', '0.8')
     path.setAttribute('marker-end', 'url(#tip)')
     host.append(path)
+
+    // A second stroke over the first, dashed and moving, so a value can be
+    // seen travelling the way it actually goes. Only on the wires that touch
+    // the picked request or one that is running: an animation on every wire
+    // repaints the whole plane every frame, for as long as the app is open.
+    const lit = [beam.from, beam.to].some((id) => id === S.pickedId || S.busy.has(id))
+    if (lit) {
+      const flow = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+      flow.setAttribute('d', path.getAttribute('d'))
+      flow.setAttribute('class', 'beam-flow')
+      host.append(flow)
+    }
 
     if (z > 0.55 && S.prefs.beamLabels !== false) {
       // Three quarters of the way along rather than the middle. One request
@@ -2315,6 +2389,7 @@ function paintBench() {
 
   const verb = req.method.toLowerCase()
   $('benchVerb').className = `verb ${verb}`
+  $('benchLive').dataset.verb = verb
   $('benchVerb').textContent = req.method
   if ($('benchName').value !== (req.name ?? '')) $('benchName').value = req.name ?? ''
   $('addrVerb').className = `addr-verb ${verb}`
@@ -2333,8 +2408,10 @@ function paintBench() {
   et.replaceChildren()
   for (const [id, label] of EDIT_TABS) {
     const n = countFor(req, id)
+    // The Tests count says how the last run went, not only how many there are.
+    const verdict = id === 'tests' && res && !res.error && res.checks?.length ? (res.failed ? ' bad' : ' ok') : ''
     et.append(
-      el('button', { class: `tab${S.editTab === id ? ' on' : ''}`, type: 'button', role: 'tab', html: `${label}${n ? `<b>${n}</b>` : ''}`, onclick: () => {
+      el('button', { class: `tab${S.editTab === id ? ' on' : ''}`, type: 'button', role: 'tab', html: `${label}${n ? `<b class="${verdict.trim()}">${n}</b>` : ''}`, onclick: () => {
         S.editTab = id
         // Picking a tab on a folded half opens it. The alternative is a click
         // that changes something you cannot see.
@@ -3236,57 +3313,485 @@ function chainFor(req) {
 
 
 
+/* ------------------------------------------------------------ the studio
+
+   Assertions are the reason a flow is worth running, so the Tests tab leads
+   with them: a score, the two fast ways to a good suite — generate it from a
+   real response, or take it from the library — and rows that read as a
+   sentence. Each row is two lines, what is checked and how, because squeezing
+   five controls into one line is what cut "JSON path" down to "JSON pat". */
+
+const SUBJECT_ICON = {
+  status: '<path d="M3 12h4l3-7 4 14 3-7h4"/>',
+  time: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M10 2h4"/>',
+  size: '<path d="M4 7h16M4 12h11M4 17h6"/>',
+  contentType: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
+  header: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+  body: '<path d="M8 4H6a2 2 0 0 0-2 2v4l-2 2 2 2v4a2 2 0 0 0 2 2h2M16 4h2a2 2 0 0 1 2 2v4l2 2-2 2v4a2 2 0 0 1-2 2h-2"/>',
+  json: '<path d="M9 7 4 12l5 5M15 7l5 5-5 5"/>',
+  schema: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><path d="M6.5 10v4a2 2 0 0 0 2 2H14"/>',
+  cookie: '<circle cx="12" cy="12" r="9"/><path d="M9 10h.01M14.5 14.5h.01M14 8.5h.01"/>',
+  redirects: '<path d="M4 17h11a4 4 0 0 0 0-8H8"/><path d="m11 6-3 3 3 3"/>',
+  transport: I.lock
+}
+
+const CATALOG_ICON = {
+  status: SUBJECT_ICON.status,
+  performance: SUBJECT_ICON.time,
+  headers: SUBJECT_ICON.header,
+  body: SUBJECT_ICON.body,
+  json: SUBJECT_ICON.json,
+  schema: SUBJECT_ICON.schema,
+  security: I.shield
+}
+
+/** What a subject with no path reads, said in the space the path would take. */
+const READS = {
+  status: 'the status code',
+  time: 'the full round trip',
+  size: 'the bytes downloaded',
+  contentType: 'the Content-Type header',
+  body: 'the raw body text',
+  redirects: 'redirects followed',
+  transport: 'the connection'
+}
+
+/** Values that come from a fixed list get a select, not a box to misspell in. */
+const CHOICES = {
+  isType: () => TYPES.map((t) => [t, t]),
+  isFormat: () => Object.entries(FORMATS).map(([id, f]) => [id, f.label]),
+  isClass: () => ['2xx', '3xx', '4xx', '5xx'].map((c) => [c, c]),
+  isSorted: () => [['asc', 'ascending'], ['desc', 'descending']],
+  hasFlag: () => ['HttpOnly', 'Secure', 'SameSite', 'SameSite=Strict', 'SameSite=Lax', 'SameSite=None'].map((f) => [f, f])
+}
+
+const SCHEMA_STARTER = '{\n  "type": "object",\n  "required": []\n}'
+
+/**
+ * Makes the value fit the operator after the subject or the operator moved.
+ * A row that switched from "equals 200" to "is of type" must not go on
+ * claiming the type is "200".
+ */
+function fitValue(a) {
+  if (!needsValue(a)) {
+    a.value = ''
+    return
+  }
+  const choices = CHOICES[a.op]?.()
+  if (choices && !choices.some(([id]) => id === a.value)) a.value = choices[0][0]
+  if (a.op === 'matchesSchema' && !String(a.value ?? '').trim().startsWith('{')) a.value = SCHEMA_STARTER
+}
+
+const subjectOf = (a) => SUBJECTS.find((s) => s.id === a.subject) ?? SUBJECTS[0]
+
+/** A ring that fills with the share that passed. */
+function scoreRing(ok, total, state, size = 44) {
+  const r = size / 2 - 3
+  const C = 2 * Math.PI * r
+  const pct = total ? ok / total : 0
+  const fill = state === 'idle' ? 0 : pct
+  const box = el('div', { class: `score${size > 50 ? ' lg' : ''}`, title: total ? `${ok} of ${total} passed` : '' })
+  box.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true">
+      <circle class="score-tr" cx="${size / 2}" cy="${size / 2}" r="${r}"></circle>
+      <circle class="score-fl${state === 'fail' ? ' bad' : state === 'idle' ? ' idle' : ''}" cx="${size / 2}" cy="${size / 2}" r="${r}" stroke-dasharray="${(C * fill).toFixed(1)} ${C.toFixed(1)}"></circle>
+    </svg><b>${state === 'idle' ? total : `${ok}/${total}`}</b>`
+  return box
+}
+
 function testsPanel(req, res) {
-  const box = el('div')
+  const box = el('div', { class: 'studio' })
+  const list = req.assertions ?? []
   const byId = new Map((res?.checks ?? []).map((c) => [c.id, c]))
-  box.append(el('div', { class: 'lbl' }, [el('span', { text: 'Assertions' })]))
+  const live = list.filter((a) => a.on !== false)
+  const ran = live.filter((a) => byId.has(a.id))
+  const failed = ran.filter((a) => !byId.get(a.id).ok).length
+  const off = list.length - live.length
+  const readable = Boolean(res && !res.error)
 
-  for (const a of req.assertions ?? []) {
-    const hit = byId.get(a.id)
-    const ops = OPERATORS[a.subject] ?? ['equals']
-    const needsPath = a.subject === 'json' || a.subject === 'header'
-    const needsValue = !['exists', 'absent', 'isEmpty', 'notEmpty', 'isSuccess'].includes(a.op)
+  const studioActs = () => [
+    el('button', {
+      class: 'btn sm',
+      type: 'button',
+      disabled: !readable,
+      title: readable ? 'Suggest a suite read off the last response' : 'Send the request first — suggestions are read off a real response',
+      html: `${ico(I.sparkle, 12, 1.9)}<span>Generate</span>`,
+      onclick: () => openGenerator(req)
+    }),
+    el('button', { class: 'btn sm go', type: 'button', html: `${ico(I.library, 12, 1.9)}<span>Library</span>`, onclick: () => openLibrary(req) })
+  ]
 
+  if (!list.length) {
     box.append(
-      el('div', { class: `assert${hit ? (hit.ok ? ' pass' : ' fail') : ''}` }, [
-        el('input', { class: 'tick', type: 'checkbox', checked: a.on !== false, 'aria-label': 'Run this assertion', onchange: (e) => {
-          a.on = e.target.checked
-        } }),
-        el('select', { class: 'subj', 'aria-label': 'Subject', onchange: (e) => {
-          a.subject = e.target.value
-          a.op = (OPERATORS[a.subject] ?? ['equals'])[0]
-          paintBench()
-        } }, SUBJECTS.map((s) => el('option', { value: s.id, text: s.label, selected: s.id === a.subject }))),
-        needsPath
-          ? el('input', { class: 'cell k', value: a.path ?? '', placeholder: a.subject === 'json' ? 'data.id' : 'X-Request-Id', 'aria-label': 'Path', oninput: (e) => {
-              a.path = e.target.value
-            } })
-          : null,
-        el('select', { class: 'op', 'aria-label': 'Operator', onchange: (e) => {
-          a.op = e.target.value
-          paintBench()
-        } }, ops.map((o) => el('option', { value: o, text: OP_LABEL[o] ?? o, selected: o === a.op }))),
-        needsValue
-          ? el('input', { class: 'cell v', value: a.value ?? '', placeholder: '200', 'aria-label': 'Expected', oninput: (e) => {
-              a.value = e.target.value
-            } })
-          : null,
-        hit ? el('span', { class: 'saw', title: hit.detail, text: hit.detail }) : null,
-        el('button', { class: 'x-btn', type: 'button', 'aria-label': 'Remove assertion', html: ico(I.x, 11, 2.3), onclick: () => {
-          req.assertions = req.assertions.filter((x) => x.id !== a.id)
-          commit()
+      el('div', { class: 'studio-empty' }, [
+        el('span', { html: ico(I.check, 20, 2.2) }),
+        el('b', { text: 'No assertions yet' }),
+        el('p', {
+          text: readable
+            ? 'Generate a suite from the response you just got, pick ready-made checks from the library, or write one yourself.'
+            : 'Send the request and Prism can generate a suite from what comes back. Or pick ready-made checks from the library now.'
+        }),
+        el('div', { class: 'studio-acts' }, [
+          ...studioActs(),
+          el('button', { class: 'btn sm plain', type: 'button', html: `${ico(I.plus, 11, 2.2)}<span>Write one</span>`, onclick: () => addAssertion(req) })
+        ])
+      ])
+    )
+    return box
+  }
+
+  const state = !ran.length ? 'idle' : failed ? 'fail' : 'pass'
+  const summary = ran.length
+    ? `<em class="pass">${ran.length - failed} passing</em>${failed ? ` · <em class="fail">${failed} failing</em>` : ''}${off ? ` · ${off} off` : ''}`
+    : `Not run yet — send the request to check ${live.length === 1 ? 'it' : 'them'}${off ? ` · ${off} off` : ''}`
+  box.append(
+    el('div', { class: `studio-head ${state}` }, [
+      scoreRing(ran.length - failed, ran.length || live.length, state),
+      el('div', { class: 'studio-words' }, [el('b', { text: `${list.length} assertion${list.length === 1 ? '' : 's'}` }), el('span', { html: summary })]),
+      el('div', { class: 'studio-acts' }, studioActs())
+    ])
+  )
+
+  const rows = el('div', { class: 'tlist' })
+  for (const a of list) rows.append(assertionRow(req, a, a.on === false ? null : byId.get(a.id), res))
+  box.append(rows)
+
+  box.append(
+    el('div', { class: 'studio-add' }, [
+      el('button', { class: 'addbtn', type: 'button', html: `${ico(I.plus, 10, 2.4)}<span>Add assertion</span>`, onclick: () => addAssertion(req) }),
+      el('span', { class: 'studio-hint', text: readable ? 'or click any value in the Payload tab to assert on it' : '' })
+    ])
+  )
+  return box
+}
+
+/** A new row, starting from something useful rather than a blank. */
+function addAssertion(req) {
+  const has = (req.assertions ?? []).some((a) => a.subject === 'status')
+  ;(req.assertions ??= []).push(has ? emptyAssertion({ subject: 'json', op: 'exists', path: '', value: '' }) : emptyAssertion())
+  S.editTab = 'tests'
+  commit()
+}
+
+function assertionRow(req, a, hit, res) {
+  const subject = subjectOf(a)
+  const ops = OPERATORS[a.subject] ?? ['equals']
+  const pathWanted = needsPath(a)
+  const repaint = () => {
+    touch()
+    paintBench()
+  }
+
+  const row = el('div', { class: `trow${a.on === false ? ' off' : hit ? (hit.ok ? ' pass' : ' fail') : ''}` })
+  const grid = el('div', { class: 'trow-grid' })
+
+  /* what is checked */
+  const groups = [...new Set(SUBJECTS.map((s) => s.group))]
+  const subj = el(
+    'select',
+    {
+      class: 'tsel subj',
+      'aria-label': 'What to check',
+      onchange: (e) => {
+        a.subject = e.target.value
+        a.op = (OPERATORS[a.subject] ?? ['equals'])[0]
+        if (!needsPath(a)) a.path = ''
+        fitValue(a)
+        commit()
+      }
+    },
+    groups.map((g) =>
+      el('optgroup', { label: g }, SUBJECTS.filter((s) => s.group === g).map((s) => el('option', { value: s.id, text: s.label, selected: s.id === a.subject })))
+    )
+  )
+  const where = pathWanted
+    ? el('input', {
+        class: 'cell tpath',
+        value: a.path ?? '',
+        placeholder: subject.pathHint ?? 'path',
+        spellcheck: 'false',
+        'aria-label': a.subject === 'header' ? 'Header name' : a.subject === 'cookie' ? 'Cookie name' : 'Path',
+        title: a.subject === 'json' ? 'A dotted path: data.items[0].id — [*] checks every item, [-1] the last' : '',
+        oninput: (e) => {
+          a.path = e.target.value
+          touch()
+        },
+        onchange: () => commit()
+      })
+    : el('span', { class: 'tfill', title: subject.blurb ?? '', text: READS[a.subject] ?? subject.blurb ?? '' })
+
+  /* how */
+  const op = el(
+    'select',
+    {
+      class: 'tsel op',
+      'aria-label': 'Operator',
+      onchange: (e) => {
+        a.op = e.target.value
+        fitValue(a)
+        repaint()
+      }
+    },
+    ops.map((o) => el('option', { value: o, text: OP_LABEL[o] ?? o, selected: o === a.op }))
+  )
+
+  let value
+  const choices = CHOICES[a.op]?.()
+  if (!needsValue(a)) {
+    value = el('span', { class: 'tfill', text: 'no value needed' })
+  } else if (a.op === 'matchesSchema') {
+    value = el('span', { class: 'tfill', text: 'the JSON Schema below' })
+  } else if (choices) {
+    value = el(
+      'select',
+      {
+        class: 'tsel',
+        'aria-label': 'Expected',
+        onchange: (e) => {
+          a.value = e.target.value
+          repaint()
+        }
+      },
+      choices.map(([id, label]) => el('option', { value: id, text: label, selected: id === a.value }))
+    )
+  } else {
+    value = el('input', {
+      class: 'cell tval',
+      value: a.value ?? '',
+      placeholder: OP_META[a.op]?.hint || subject.valueHint || 'expected',
+      spellcheck: 'false',
+      'aria-label': 'Expected',
+      oninput: (e) => {
+        a.value = e.target.value
+        touch()
+      }
+    })
+  }
+
+  grid.append(
+    el('input', { class: 'tick', type: 'checkbox', checked: a.on !== false, 'aria-label': 'Run this assertion', onchange: (e) => {
+      a.on = e.target.checked
+      repaint()
+    } }),
+    el('div', { class: 'tline what' }, [subj, where]),
+    el('button', { class: 'x-btn', type: 'button', title: 'Remove', 'aria-label': 'Remove assertion', html: ico(I.x, 11, 2.3), onclick: () => {
+      req.assertions = req.assertions.filter((x) => x.id !== a.id)
+      commit()
+    } }),
+    el('span', { class: 'tgutter' }),
+    el('div', { class: 'tline how' }, [op, value])
+  )
+
+  if (a.op === 'matchesSchema') {
+    const area = el('textarea', {
+      class: 'tschema',
+      spellcheck: 'false',
+      'aria-label': 'JSON Schema',
+      oninput: (e) => {
+        a.value = e.target.value
+        touch()
+      }
+    })
+    area.value = a.value ?? ''
+    const sample = res && !res.error && res.json !== undefined ? (a.path ? jsonPath(res.json, a.path) : res.json) : undefined
+    grid.append(
+      area,
+      el('div', { class: 'tschema-acts' }, [
+        el('button', {
+          class: 'tiny',
+          type: 'button',
+          disabled: sample === undefined,
+          title: sample === undefined ? 'Send the request to read a shape off it' : 'Write a schema from the last response',
+          text: 'Use the response’s shape',
+          onclick: () => {
+            a.value = JSON.stringify(inferSchema(sample), null, 2)
+            repaint()
+          }
+        }),
+        el('button', { class: 'tiny', type: 'button', text: 'Format', onclick: () => {
+          try {
+            a.value = JSON.stringify(JSON.parse(a.value), null, 2)
+            repaint()
+          } catch (err) {
+            toast('bad', `That schema is not valid JSON — ${err.message}`)
+          }
         } })
       ])
     )
   }
 
-  box.append(
-    el('button', { class: 'addbtn', type: 'button', html: `${ico(I.plus, 10, 2.4)}<span>Add assertion</span>`, onclick: () => {
-      ;(req.assertions ??= []).push(emptyAssertion())
-      commit()
-    } })
-  )
-  return box
+  row.append(grid)
+  if (hit) {
+    row.append(el('div', { class: 'trow-saw', title: hit.detail }, [el('span', { html: ico(hit.ok ? I.check : I.x, 11, 2.6) }), el('span', { text: hit.detail })]))
+  }
+  return row
+}
+
+/* --------------------------------------------------------- the library */
+
+/**
+ * Ready-made checks, by what people go looking for. A click adds one to the
+ * request and leaves the sheet open, because a suite is five of these, not
+ * one; the card turns green so it is clear which are already in.
+ */
+function openLibrary(req) {
+  let at = CATALOG[0]?.id ?? ''
+  let q = ''
+  const added = new Set()
+  const total = CATALOG.reduce((n, g) => n + g.items.length, 0)
+  const body = el('div', { class: 'lib' })
+  const search = el('input', {
+    type: 'search',
+    placeholder: 'Search checks',
+    'aria-label': 'Search the library',
+    spellcheck: 'false',
+    oninput: (e) => {
+      q = e.target.value.trim().toLowerCase()
+      paintMain()
+    }
+  })
+  const side = el('div', { class: 'lib-side' })
+  const main = el('div', { class: 'lib-main' })
+
+  const paintSide = () => {
+    side.replaceChildren(el('label', { class: 'lib-search' }, [el('span', { html: ico(I.search, 13, 2) }), search]))
+    for (const g of CATALOG) {
+      side.append(
+        el('button', { class: `lib-cat${g.id === at && !q ? ' on' : ''}`, type: 'button', onclick: () => {
+          at = g.id
+          q = ''
+          search.value = ''
+          paintSide()
+          paintMain()
+        } }, [
+          el('span', { class: 'page-ico', html: ico(CATALOG_ICON[g.id] ?? I.check, 13, 1.9) }),
+          el('span', { class: 'page-label', text: g.label }),
+          el('span', { class: 'count', text: String(g.items.length) })
+        ])
+      )
+    }
+  }
+
+  const card = (item) => {
+    const done = added.has(item.id)
+    return el('button', {
+      class: `lib-card${done ? ' added' : ''}`,
+      type: 'button',
+      title: done ? 'Added — click again to add another copy' : 'Add to this request',
+      onclick: () => {
+        ;(req.assertions ??= []).push(emptyAssertion({ ...item.assertion }))
+        added.add(item.id)
+        S.editTab = 'tests'
+        commit()
+        paintMain()
+      }
+    }, [
+      el('span', { class: 'lib-add', html: ico(done ? I.check : I.plus, 11, 2.6) }),
+      el('b', { text: item.title }),
+      el('span', { text: item.blurb }),
+      el('code', { class: 'lib-code', text: describe(item.assertion) })
+    ])
+  }
+
+  const paintMain = () => {
+    main.replaceChildren()
+    if (q) {
+      const hits = CATALOG.flatMap((g) => g.items).filter((i) => `${i.title} ${i.blurb} ${describe(i.assertion)}`.toLowerCase().includes(q))
+      main.append(el('h4', { class: 'lib-title', text: `${hits.length} match${hits.length === 1 ? '' : 'es'}` }), el('p', { class: 'lib-blurb', text: `For “${q}”, across every group.` }))
+      main.append(hits.length ? el('div', { class: 'lib-grid' }, hits.map(card)) : el('p', { class: 'lib-none', text: 'Nothing in the library says that. Try “status”, “header” or “email”.' }))
+      paintSide()
+      return
+    }
+    const g = CATALOG.find((x) => x.id === at) ?? CATALOG[0]
+    main.append(el('h4', { class: 'lib-title', text: g.label }), el('p', { class: 'lib-blurb', text: g.blurb }), el('div', { class: 'lib-grid' }, g.items.map(card)))
+  }
+
+  paintSide()
+  paintMain()
+  body.append(side, main)
+  sheet({
+    title: 'Assertion library',
+    blurb: `${total} ready-made checks. Click one to add it to ${req.name || 'this request'}, then point its path at the real field.`,
+    body,
+    acts: [],
+    wide: true
+  })
+  setTimeout(() => search.focus(), 0)
+}
+
+/* ------------------------------------------------------- the generator */
+
+/**
+ * A suite read off the last response, offered as a checklist.
+ *
+ * Every suggestion is checked against that same response before it is shown,
+ * and says so — a generated test that fails on the spot teaches people to
+ * ignore generated tests. Ones the request already has are left out.
+ */
+function openGenerator(req) {
+  const res = S.results.get(req.id)
+  if (!res || res.error) {
+    toast('bad', 'Send the request first — suggestions are read off a real response.')
+    return
+  }
+  const keyOf = (a) => `${a.subject}|${a.op}|${a.path ?? ''}|${a.value ?? ''}`
+  const have = new Set((req.assertions ?? []).map(keyOf))
+  const offers = suggestTests(res).filter((s) => !have.has(keyOf(s.assertion)))
+  if (!offers.length) {
+    toast('ok', 'This request already checks everything Prism would suggest.')
+    return
+  }
+  const chosen = new Set(offers.filter((s) => s.picked).map((s) => s.assertion.id))
+  const body = el('div', { class: 'gen' })
+
+  const paint = () => {
+    body.replaceChildren(
+      el('div', { class: 'gen-bar', html: `Read from the <b>${esc(String(res.status))}</b> response at ${esc(new Date(res.at).toLocaleTimeString())} — <b>${chosen.size}</b> of ${offers.length} selected` })
+    )
+    for (const group of [...new Set(offers.map((s) => s.group))]) {
+      const box = el('div', { class: 'gen-group' }, [el('div', { class: 'gen-head', text: group })])
+      for (const s of offers.filter((x) => x.group === group)) {
+        const on = chosen.has(s.assertion.id)
+        const now = check(s.assertion, res)
+        box.append(
+          el('label', { class: `gen-row${on ? ' on' : ''}` }, [
+            el('input', { class: 'tick', type: 'checkbox', checked: on, onchange: (e) => {
+              if (e.target.checked) chosen.add(s.assertion.id)
+              else chosen.delete(s.assertion.id)
+              paint()
+            } }),
+            el('span', { class: 'gen-words' }, [el('b', { text: s.label }), s.label === describe(s.assertion) ? el('code', { text: now.detail }) : el('code', { text: describe(s.assertion) })]),
+            el('span', { class: `gen-saw${now.ok ? '' : ' bad'}`, title: now.detail, text: now.ok ? 'passes now' : 'fails now' })
+          ])
+        )
+      }
+      body.append(box)
+    }
+  }
+  paint()
+
+  sheet({
+    title: `Generate tests for ${req.name || 'this request'}`,
+    blurb: 'Types, formats and shapes rather than today’s values, so the suite still passes tomorrow. Untick anything you do not want.',
+    body,
+    acts: [
+      {
+        label: 'Add the selected',
+        go: true,
+        onClick: () => {
+          const picked = offers.filter((s) => chosen.has(s.assertion.id)).map((s) => s.assertion)
+          if (!picked.length) return
+          req.assertions = [...(req.assertions ?? []), ...picked]
+          S.editTab = 'tests'
+          // Checked against the response already in hand, so the rows arrive
+          // green instead of waiting for the next send.
+          res.checks = runAll(req.assertions, res)
+          res.failed = res.checks.filter((c) => !c.ok).length
+          commit()
+          toast('ok', `${picked.length} assertion${picked.length === 1 ? '' : 's'} added`)
+        }
+      }
+    ]
+  })
 }
 
 function chainPanel(req) {
@@ -3559,7 +4064,7 @@ function respPanel(req, res) {
     case 'payload':
       return payloadPanel(res, req)
     case 'headers':
-      return headersPanel(res)
+      return headersPanel(res, req)
     case 'shape':
       return shapePanel(res)
     case 'diff':
@@ -3571,7 +4076,7 @@ function respPanel(req, res) {
     case 'timing':
       return timingPanel(res)
     default:
-      return resultPanel(res)
+      return resultPanel(res, req)
   }
 }
 
@@ -3609,7 +4114,13 @@ function briefPanel(req) {
 
 const tile = (t, v, l) => el('div', { class: `tile ${t}` }, [el('b', { text: v }), el('span', { text: l })])
 
-function resultPanel(res) {
+/**
+ * The verdict on one response: four numbers, then every assertion as the
+ * sentence it checks and what the response actually said. Failures first,
+ * because a report that makes you scroll past six greens to find the red is
+ * a report that hides the red.
+ */
+function resultPanel(res, req) {
   const box = el('div')
   const gql = gqlPanel(res)
   if (gql) box.append(gql)
@@ -3617,25 +4128,59 @@ function resultPanel(res) {
     box.append(el('div', { class: 'find bad' }, [el('div', { class: 'find-bar' }), el('div', {}, [el('b', { text: 'No response' }), el('p', { text: res.error })])]))
     return box
   }
+  const secure = res.secure === true || Boolean(res.request?.url?.startsWith('https'))
   box.append(
     el('div', { class: 'tiles' }, [
       tile(tone(res.status), String(res.status), word(res.status)),
-      tile(res.timing.total > 1000 ? 'warn' : 'info', String(res.timing.total), 'milliseconds'),
-      tile('', fmtBytes(res.bytes), 'downloaded'),
-      tile(res.request?.url?.startsWith('https') ? 'ok' : 'warn', res.request?.url?.startsWith('https') ? 'TLS' : 'PLAIN', 'transport')
+      tile(res.timing.total > 1000 ? 'warn' : 'info', `${res.timing.total} ms`, 'time'),
+      tile('', fmtBytes(res.bytes), 'size'),
+      tile(secure ? 'ok' : 'warn', secure ? 'HTTPS' : 'HTTP', secure ? 'encrypted' : 'not encrypted')
     ])
   )
-  box.append(el('div', { class: 'lbl' }, [el('span', { text: 'Assertions' })]))
-  if (!res.checks.length) box.append(el('p', { class: 'note', text: 'Nothing checked this response.' }))
-  for (const c of res.checks) {
+
+  const checks = res.checks ?? []
+  if (!checks.length) {
     box.append(
-      el('div', { class: `chg ${c.ok ? 'added' : 'removed'}` }, [
-        el('b', { text: c.ok ? 'pass' : 'fail' }),
-        el('span', { class: 'p', text: SUBJECTS.find((s) => s.id === c.assertion.subject)?.label ?? c.assertion.subject }),
-        el('span', { class: c.ok ? 'now' : 'was', text: c.detail })
+      el('div', { class: 'studio-empty' }, [
+        el('span', { html: ico(I.check, 20, 2.2) }),
+        el('b', { text: 'Nothing checked this response' }),
+        el('p', { text: 'Generate a suite from it — status, headers, types, formats and shape, each already passing — or pick checks from the library.' }),
+        req
+          ? el('div', { class: 'studio-acts' }, [
+              el('button', { class: 'btn sm go', type: 'button', html: `${ico(I.sparkle, 12, 1.9)}<span>Generate tests</span>`, onclick: () => openGenerator(req) }),
+              el('button', { class: 'btn sm', type: 'button', html: `${ico(I.library, 12, 1.9)}<span>Library</span>`, onclick: () => openLibrary(req) })
+            ])
+          : null
       ])
     )
+    return box
   }
+
+  const failed = checks.filter((c) => !c.ok)
+  const state = failed.length ? 'fail' : 'pass'
+  box.append(
+    el('div', { class: 'report' }, [
+      el('div', { class: `report-head ${state}` }, [
+        scoreRing(checks.length - failed.length, checks.length, state, 56),
+        el('div', { class: 'report-words' }, [
+          el('b', { text: failed.length ? `${failed.length} of ${checks.length} assertions failed` : `All ${checks.length} assertions passed` }),
+          el('span', { text: failed.length ? `First failure: ${describe(failed[0].assertion)}` : `Checked at ${new Date(res.at).toLocaleTimeString()}` })
+        ]),
+        req ? el('button', { class: 'btn sm', type: 'button', text: 'Edit tests', onclick: () => {
+          S.editTab = 'tests'
+          if (S.pane === 'response') S.pane = 'split'
+          paintBench()
+        } }) : null
+      ]),
+      ...[...failed, ...checks.filter((c) => c.ok)].map((c) =>
+        el('div', { class: `rcheck ${c.ok ? 'pass' : 'fail'}` }, [
+          el('span', { class: 'rcheck-ico', html: ico(c.ok ? I.check : I.x, 11, 2.8) }),
+          el('div', { class: 'rcheck-words' }, [el('b', { text: describe(c.assertion) }), el('span', { text: c.detail })]),
+          el('span', { class: 'rcheck-tag', text: SUBJECTS.find((s) => s.id === c.assertion.subject)?.label ?? c.assertion.subject })
+        ])
+      )
+    ])
+  )
   return box
 }
 
@@ -3843,6 +4388,18 @@ function fieldMenu(e, req, line) {
         toast('ok', `Asserting ${line.path} is there`)
       }
     },
+    // The type and the format survive the next call; the value often does
+    // not. These are the assertions worth keeping on an id or a timestamp.
+    ...fieldChecks(line).map(({ label, fields }) => ({
+      label,
+      icon: I.check,
+      run: () => {
+        req.assertions = [...(req.assertions ?? []), emptyAssertion({ subject: 'json', path: line.path, ...fields })]
+        S.editTab = 'tests'
+        commit()
+        toast('ok', `${describe({ subject: 'json', path: line.path, ...fields })}`)
+      }
+    })),
     { sep: true },
     {
       label: 'Copy the path',
@@ -3863,6 +4420,20 @@ function fieldMenu(e, req, line) {
   ])
 }
 
+/** Durable checks a value suggests: its type, and a format when it has one. */
+function fieldChecks(line) {
+  const v = line.value
+  const type = v === null ? 'null' : Array.isArray(v) ? 'array' : Number.isInteger(v) ? 'integer' : typeof v
+  const out = [{ label: `Assert it is ${/^[aeiou]/.test(type) ? 'an' : 'a'} ${type}`, fields: { op: 'isType', value: type } }]
+  if (typeof v === 'string') {
+    const format = ['email', 'uuid', 'date-time', 'date', 'uri', 'jwt', 'ipv4', 'semver'].find((f) => FORMATS[f]?.test(v))
+    if (format) out.push({ label: `Assert it is a valid ${FORMATS[format].label.replace(/ \(.*\)$/, '')}`, fields: { op: 'isFormat', value: format } })
+    if (v) out.push({ label: 'Assert it is not empty', fields: { op: 'notEmpty', value: '' } })
+  }
+  if (typeof v === 'number' && v > 0) out.push({ label: 'Assert it is over 0', fields: { op: 'greaterThan', value: '0' } })
+  return out
+}
+
 /** A capture name nothing else in the workspace already claims. */
 function freeCaptureName(stem) {
   const taken = new Set(allRequests().flatMap((r) => (r.captures ?? []).map((c) => c.name)))
@@ -3874,11 +4445,33 @@ function freeCaptureName(stem) {
 
 const mask = (v) => (String(v).length <= 12 ? '••••••' : `${String(v).slice(0, 6)}${'•'.repeat(9)}${String(v).slice(-4)}`)
 
-function headersPanel(res) {
+function headersPanel(res, req) {
   const box = el('div')
-  box.append(el('div', { class: 'lbl' }, [el('span', { text: 'Response' })]))
+  box.append(el('div', { class: 'lbl' }, [el('span', { text: 'Response' }), req ? el('em', { text: 'the + beside a name asserts on it' }) : null]))
   const a = el('dl', { class: 'pairs' })
-  for (const [k, v] of Object.entries(res.headers ?? {})) a.append(el('dt', { text: k }), el('dd', { text: v }))
+  for (const [k, v] of Object.entries(res.headers ?? {})) {
+    const assertOn = (fields) => {
+      req.assertions = [...(req.assertions ?? []), emptyAssertion({ subject: 'header', path: k, ...fields })]
+      S.editTab = 'tests'
+      commit()
+      toast('ok', describe({ subject: 'header', path: k, ...fields }))
+    }
+    const act = req
+      ? el('button', {
+          class: 'hdr-act',
+          type: 'button',
+          title: `Assert on ${k}`,
+          'aria-label': `Assert on ${k}`,
+          html: ico(I.plus, 10, 2.6),
+          onclick: (e) =>
+            openMenu(e.currentTarget, [
+              { label: `Assert ${k} is present`, icon: I.check, run: () => assertOn({ op: 'exists', value: '' }) },
+              { label: `Assert it equals ${String(v).length > 24 ? `${String(v).slice(0, 21)}…` : v}`, icon: I.check, run: () => assertOn({ op: 'equals', value: String(v) }) }
+            ])
+        })
+      : null
+    a.append(el('dt', {}, [document.createTextNode(k), act]), el('dd', { text: v }))
+  }
   box.append(a)
 
   box.append(el('div', { class: 'lbl', style: 'margin-top:14px' }, [el('span', { text: 'Request' })]))
@@ -6400,9 +6993,24 @@ const HELP = [
           html: 'An assertion is a <strong>subject</strong> and an <strong>operator</strong>, so either half can change without picking a different assertion from a list. Every result says what it actually saw — a red row that will not tell you what it found is a row people delete.'
         })
       )
+      doc.append(el('h4', { text: 'Three ways to a suite' }))
+      doc.append(
+        el('ul', {}, [
+          el('li', { html: '<strong>Generate</strong> reads the last response and proposes a suite: the status, the content type, a time budget with room in it, the type of every top-level field, formats it recognises — email, UUID, ISO dates, URLs — and the response&rsquo;s shape as a JSON Schema. It never compares against a value that will change on the next call, and every suggestion is checked against that response before it is offered.' }),
+          el('li', { html: `The <strong>library</strong> holds ${CATALOG.reduce((n, g) => n + g.items.length, 0)} ready-made checks in ${CATALOG.length} groups — status codes, performance, headers, body, JSON fields, schema and security headers. Click one and it is added; point its path at the real field afterwards.` }),
+          el('li', { html: 'In the <strong>Payload</strong> tab, click any value to assert it equals what it says now, that it exists, its type, or its format. In <strong>Headers</strong>, the + beside a name does the same for a header.' })
+        ])
+      )
+      doc.append(el('h4', { text: 'Paths' }))
+      doc.append(
+        el('p', {
+          html: '<code>data.items[0].id</code> and <code>data.items.0.id</code> both work, and so does a leading <code>$.</code>. <code>[-1]</code> is the last item. <code>[*]</code> checks <em>every</em> item — <code>items[*].price</code> is over <code>0</code> passes only when all of them are, and a failure names the first one that was not. With a wildcard, <em>has no duplicates</em> and <em>is sorted</em> look at the collected list.'
+        })
+      )
       for (const subject of SUBJECTS) {
         const ops = (OPERATORS[subject.id] ?? []).map((o) => OP_LABEL[o] ?? o).join(', ')
         doc.append(el('h4', { text: subject.label }))
+        if (subject.blurb) doc.append(el('p', { text: subject.blurb }))
         doc.append(el('p', { html: `<code>${esc(ops)}</code>` }))
       }
       doc.append(
@@ -7191,7 +7799,7 @@ let sheetUp = false
 
 let onSheetClose = null
 
-function sheet({ title, blurb, body, acts, onClose }) {
+function sheet({ title, blurb, body, acts, onClose, wide = false }) {
   const veil = $('veil')
   veil.replaceChildren()
   veil.hidden = false
@@ -7212,7 +7820,7 @@ function sheet({ title, blurb, body, acts, onClose }) {
   }
 
   veil.append(
-    el('div', { class: 'sheet' }, [
+    el('div', { class: `sheet${wide ? ' wide' : ''}` }, [
       el('div', { class: 'sheet-top' }, [el('h2', { text: title }), blurb ? el('p', { text: blurb }) : null]),
       el('div', { class: 'sheet-mid' }, [body]),
       low
