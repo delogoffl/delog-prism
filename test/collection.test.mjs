@@ -107,13 +107,13 @@ test('Postman auth maps onto the auth block', () => {
   assert.equal(login.auth.token, '{{token}}')
 })
 
-test('assertions are recovered from a Postman test script', () => {
+test('a Postman test script comes across whole, to run as written', () => {
   const parsed = fromPostman(POSTMAN)
   const login = parsed.flows.flatMap((f) => f.requests).find((r) => r.name === 'Login')
-  assert.deepEqual(
-    login.assertions.map((a) => `${a.subject}:${a.op}:${a.value}`),
-    ['status:equals:201', 'time:lessThan:800']
-  )
+  assert.match(login.scripts.test, /pm\.response\.to\.have\.status\(201\)/)
+  assert.match(login.scripts.test, /to\.be\.below\(800\)/)
+  // Not translated into assertions as well, which would report every check twice.
+  assert.deepEqual(login.assertions, [])
 })
 
 test('a script Canvas cannot read yields no assertions rather than invented ones', () => {

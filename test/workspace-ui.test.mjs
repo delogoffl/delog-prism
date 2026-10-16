@@ -26,12 +26,16 @@ test('every flow gets a lane, drawn from where its nodes are', () => {
   assert.match(bodyOf('function drag('), /paintLanes\(\)/, 'a lane must follow a dragged node')
 })
 
-test('wires attach to the handles on the card edge', () => {
+test('lines and interchanges run through the stop markers', () => {
+  // Every line and every transfer meets a stop at the centre of its marker,
+  // HANDLE_Y below the top of the node, so a line never passes a stop at the
+  // wrong height — and the legs between stops keep to transit-map angles.
   const beams = bodyOf('function drawBeams(')
-  assert.match(beams, /a\.y \+ HANDLE_Y \* z/)
-  assert.match(beams, /b\.y \+ HANDLE_Y \* z/)
-  assert.match(css, /\.handle\.in \{/)
-  assert.match(css, /\.handle\.out \{/)
+  assert.match(beams, /\(at\.y \+ HANDLE_Y\) \* z \+ y/)
+  assert.match(beams, /\(at\.x \+ NODE_W \/ 2\) \* z \+ x/)
+  assert.match(beams, /octilinear\(/)
+  assert.match(css, /\.metro-line \{/)
+  assert.match(css, /\.metro-xfer \{/)
 })
 
 test('the minimap follows the view and moves it', () => {

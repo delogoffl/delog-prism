@@ -232,7 +232,8 @@ test('focus is always visible', () => {
     '.bench-grip:focus-visible': '.bench-grip:focus-visible span',
     '.tree-filter input:focus': '.tree-filter:focus-within',
     '.find-field:focus': '.find-bar-row:focus-within',
-    '.set-search:focus': '.set-find:focus-within'
+    '.set-search:focus': '.set-find:focus-within',
+    '.code-area:focus': '.code-edit:focus-within'
   }
 
   for (const m of CSS.matchAll(/([^\n{}]+)\{([^}]*outline:\s*(?:none|0)\b[^}]*)\}/g)) {
@@ -352,8 +353,10 @@ test('every theme state tells the browser which one it is', () => {
     // Explicit choices, which must win in both directions.
     [":root[data-theme='dark'] {", 'dark'],
     [":root[data-theme='light'] {", 'light'],
+    // Pure black is a dark scheme with the lights off.
+    [":root[data-theme='black'] {", 'dark'],
     // And the system-light case, where no attribute is stamped at all.
-    [":root:not([data-theme='dark']) {", 'light']
+    [":root:not([data-theme='dark']):not([data-theme='black']) {", 'light']
   ]
 
   for (const [selector, want] of states) {
@@ -365,9 +368,33 @@ test('every theme state tells the browser which one it is', () => {
 })
 
 test('no rule targets a data-theme the app never sets', () => {
-  // themeAttribute() returns 'dark', 'light' or nothing, so a :root rule for
+  // themeAttribute() returns 'dark', 'light', 'black' or nothing, so a :root rule for
   // any other value matches nothing and quietly does nothing — which is how
   // half the color-scheme handling went missing.
   const roots = [...CSS.matchAll(/:root\[data-theme='([^']+)'\]/g)].map((m) => m[1])
-  assert.deepEqual([...new Set(roots)].sort(), ['dark', 'light'])
+  assert.deepEqual([...new Set(roots)].sort(), ['black', 'dark', 'light'])
+})
+
+test('a switch keeps its size beside text that wraps', () => {
+  // In a flex row with a two-line description, the switch was squashed
+  // narrower than the one above it.
+  const rule = /\n\.switch \{([^}]*)\}/.exec(CSS)
+  assert.ok(rule, '.switch is not styled')
+  assert.match(rule[1], /flex:\s*none/)
+})
+
+test('small decisions use the ticket card, not the wide sheet', () => {
+  // A two-line question stretched across an 820px sheet read as a page, not a
+  // question. Confirms and one-field prompts get a card their own size.
+  const app = readFileSync(new URL('../renderer/app.js', import.meta.url), 'utf8')
+  for (const fn of ['function ask(', 'function promptText(']) {
+    const at = app.indexOf(fn)
+    assert.ok(at > 0, `${fn} is gone`)
+    const body = app.slice(at, app.indexOf('\n}\n', at))
+    assert.match(body, /cardDialog\(/, `${fn} should use cardDialog`)
+    assert.doesNotMatch(body, /\bsheet\(\{/, `${fn} uses the wide sheet`)
+  }
+  assert.match(app, /function askDelete\(/, 'the delete confirm is still there')
+  const card = /\n\.cf \{([^}]*)\}/.exec(CSS)
+  assert.ok(card && /width:\s*min\(420px/.test(card[1]), 'the card keeps its own width')
 })

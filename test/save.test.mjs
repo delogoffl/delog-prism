@@ -125,7 +125,7 @@ test('Save writes back to the open file instead of prompting again', () => {
 })
 
 test('Open remembers the path, so the next Save is a save', () => {
-  const body = bodyOf(app, 'async function openWorkspace()')
+  const body = bodyOf(app, 'async function openWorkspace(')
   assert.match(body, /S\.filePath = chosen\.path/)
 })
 
@@ -194,10 +194,12 @@ test('only a real dialog, or this process’s own record of one, widens that set
   // The rule, rather than a count: a path may enter `chosenPaths` when the
   // user drove a workspace dialog (workspace:open, workspace:saveAs) or when
   // the main process reads back the path it wrote down after one
-  // (workspace:restore). What must never widen it is anything taking a path
+  // (workspace:restore). The folder pair (workspace:openFolder,
+  // workspace:saveAsFolder) are the same two dialogs for a workspace kept as a
+  // folder. What must never widen it is anything taking a path
   // from the renderer -- or the generic file:open used by Import, which is how
   // an imported Postman collection came to be overwritten by Save.
-  const allowed = ["ipcMain.handle('workspace:open'", "ipcMain.handle('workspace:saveAs'", "ipcMain.handle('workspace:restore'"]
+  const allowed = ["ipcMain.handle('workspace:open'", "ipcMain.handle('workspace:saveAs'", "ipcMain.handle('workspace:restore'", "ipcMain.handle('workspace:saveAsFolder'", "ipcMain.handle('workspace:openFolder'"]
   const bounds = allowed
     .map((needle) => {
       const at = main.indexOf(needle)
@@ -216,7 +218,7 @@ test('only a real dialog, or this process’s own record of one, widens that set
     assert.doesNotMatch(
       outside,
       /chosenPaths\.add\(/,
-      'a path is being recorded outside the three handlers allowed to do it'
+      'a path is being recorded outside the dialog handlers allowed to do it'
     )
     accounted += (main.slice(start, end).match(/chosenPaths\.add\(/g) ?? []).length
     cursor = end
@@ -555,7 +557,7 @@ test('a file re-serialises to the same fingerprint it was written with', () => {
 test('Import reads a file without making it the open document', () => {
   const body = handlerOf(main, 'file:open')
   assert.doesNotMatch(body, /rememberFile\(|chosenPaths\.add\(/, 'an imported file must never become a Save target')
-  assert.match(bodyOf(app, 'async function openWorkspace()'), /workspace\.open\(\)/, 'Open must use the workspace-only dialog')
+  assert.match(bodyOf(app, 'async function openWorkspace('), /workspace\.open\(\)/, 'Open must use the workspace-only dialog')
 })
 
 test('only a real workspace can be remembered or handed back', () => {

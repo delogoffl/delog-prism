@@ -162,6 +162,7 @@ test('an explicit choice stamps the attribute, and system stamps nothing', () =>
   // freeze the app to whatever the machine was on at boot.
   assert.equal(themeAttribute('dark'), 'dark')
   assert.equal(themeAttribute('light'), 'light')
+  assert.equal(themeAttribute('black'), 'black')
   assert.equal(themeAttribute('system'), null)
   assert.equal(themeAttribute(undefined), null)
 })
@@ -263,4 +264,29 @@ test('a secret setting is never written to storage', async () => {
   const store = new Map()
   save({ getItem: () => null, setItem: (k, v) => store.set(k, v) }, { [secret.id]: 'hunter2' })
   assert.doesNotMatch([...store.values()].join(''), /hunter2/)
+})
+
+test('settings rows read from the main process draw their last answer first, so a re-render keeps its height', () => {
+  // Drawn as a one-line placeholder on every re-render, the Data group came
+  // back shorter and picking an option further down scrolled the page.
+  const app = readFileSync(new URL('../renderer/app.js', import.meta.url), 'utf8')
+  for (const [fn, seen] of [['cookieRow', 'cookieSeen'], ['storedRow', 'storedSeen']]) {
+    const at = app.indexOf(`function ${fn}(`)
+    assert.ok(at > 0, `${fn} is gone`)
+    const body = app.slice(at, app.indexOf('\n}\n', at))
+    const fromCache = body.indexOf(seen)
+    const fetch = body.indexOf('window.prism.')
+    assert.ok(fromCache > 0 && fromCache < fetch, `${fn} must fill from ${seen} before it asks the main process`)
+  }
+})
+
+test('jumping to a settings section measures inside the scrolling box, not from the page', () => {
+  // offsetTop counts from the page view, header and title included, so every
+  // section — most visibly AI, near the end — landed with its heading cut off.
+  const app = readFileSync(new URL('../renderer/app.js', import.meta.url), 'utf8')
+  const jump = app.slice(app.indexOf('function jumpToSetting('), app.indexOf('function spySettings('))
+  assert.match(jump, /topIn\(scroll, target\)/)
+  assert.doesNotMatch(jump, /target\.offsetTop/)
+  const spy = app.slice(app.indexOf('function spySettings('), app.indexOf('\n}\n', app.indexOf('function spySettings(')))
+  assert.doesNotMatch(spy, /sec\.offsetTop/)
 })
