@@ -73,8 +73,14 @@ cache trick is the one that survives being handed to somebody else.
 `buildResources` directory, so they need no config.
 
 Delete them and the build logs `default Electron icon is used` — a log line,
-not a warning — and ships an installer wearing the Electron logo. The glyph is
-the node-graph mark used on the Delog site's Prism card.
+not a warning — and ships an installer wearing the Electron logo.
+
+The icon is the mark from the app itself — a stop on an orange line, on a
+paper tile — and it is drawn, not hand-exported. `npm run icon` regenerates
+`build/icon.ico` (16 to 256 px), `build/icon.png` (512 px, the window and
+taskbar icon at runtime) and the 1024 px master `icon/Prism.png` from
+`scripts/make-icon.cjs`. The small sizes are drawn with a heavier ring and
+line rather than scaled down, so the taskbar icon stays crisp.
 
 ## Installer behaviour
 

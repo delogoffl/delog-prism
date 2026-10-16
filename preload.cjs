@@ -5,7 +5,7 @@
  * capability with a fixed shape, so widening what the renderer can do means
  * editing this file and main.cjs together.
  */
-const { contextBridge, ipcRenderer } = require('electron')
+const { contextBridge, ipcRenderer, webFrame } = require('electron')
 
 contextBridge.exposeInMainWorld('prism', {
   window: {
@@ -40,10 +40,52 @@ contextBridge.exposeInMainWorld('prism', {
     restore: () => ipcRenderer.invoke('workspace:restore'),
     forget: () => ipcRenderer.invoke('workspace:forget'),
     saveAs: (payload) => ipcRenderer.invoke('workspace:saveAs', payload),
+    /** The workspace as a folder of small files, for Git. */
+    saveAsFolder: (payload) => ipcRenderer.invoke('workspace:saveAsFolder', payload),
+    openFolder: () => ipcRenderer.invoke('workspace:openFolder'),
     /** Writes back to an already-chosen file, so Save needs no dialog. */
     write: (payload) => ipcRenderer.invoke('workspace:write', payload),
     reveal: (path) => ipcRenderer.invoke('workspace:reveal', path),
     reread: (path) => ipcRenderer.invoke('workspace:reread', path)
+  },
+  /** Automatic backups, in Prism's own folder. Names are checked in main. */
+  ai: {
+    ask: (payload) => ipcRenderer.invoke('ai:ask', payload),
+    hasKey: () => ipcRenderer.invoke('ai:hasKey'),
+    setKey: (key) => ipcRenderer.invoke('ai:setKey', key),
+    clearKey: () => ipcRenderer.invoke('ai:clearKey')
+  },
+  grpc: {
+    describe: (payload) => ipcRenderer.invoke('grpc:describe', payload),
+    call: (payload) => ipcRenderer.invoke('grpc:call', payload)
+  },
+  stream: {
+    open: (options) => ipcRenderer.invoke('stream:open', options),
+    send: (payload) => ipcRenderer.invoke('stream:send', payload),
+    close: (id) => ipcRenderer.invoke('stream:close', id),
+    onEvent: (fn) => {
+      const handler = (_e, event) => fn(event)
+      ipcRenderer.on('stream:event', handler)
+      return () => ipcRenderer.off('stream:event', handler)
+    }
+  },
+  mock: {
+    start: (options) => ipcRenderer.invoke('mock:start', options),
+    update: (options) => ipcRenderer.invoke('mock:update', options),
+    stop: () => ipcRenderer.invoke('mock:stop'),
+    status: () => ipcRenderer.invoke('mock:status'),
+    onHit: (fn) => {
+      const handler = (_e, hit) => fn(hit)
+      ipcRenderer.on('mock:hit', handler)
+      return () => ipcRenderer.off('mock:hit', handler)
+    }
+  },
+  backup: {
+    keep: (payload) => ipcRenderer.invoke('backup:keep', payload),
+    list: () => ipcRenderer.invoke('backup:list'),
+    read: (name) => ipcRenderer.invoke('backup:read', name),
+    remove: (name) => ipcRenderer.invoke('backup:remove', name),
+    reveal: () => ipcRenderer.invoke('backup:reveal')
   },
   cookies: {
     list: () => ipcRenderer.invoke('cookies:list'),
@@ -55,5 +97,10 @@ contextBridge.exposeInMainWorld('prism', {
   },
   shell: {
     open: (url) => ipcRenderer.invoke('shell:open', url)
+  },
+  /** How large the whole interface is drawn — fitted to the window on a laptop. */
+  ui: {
+    zoom: () => webFrame.getZoomFactor(),
+    setZoom: (factor) => webFrame.setZoomFactor(Math.min(1.4, Math.max(0.6, Number(factor) || 1)))
   }
 })

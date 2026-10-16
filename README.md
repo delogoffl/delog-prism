@@ -16,17 +16,58 @@ npm start
 ```
 
 ```bash
-npm test          # 483 tests. No Electron, no browser, no display needed.
+npm test          # 791 tests. No Electron, no browser, no display needed.
 npm run dist      # installers for the current platform
 
 # and in CI
 npx prism-run checkout.prism.json --env CI --reporter junit --out results.xml
+npx prism-run checkout.prism.json --env CI --reporter html --out report.html
+npx prism-run checkout.prism.json --env CI --data users.csv   # one iteration per row
+npx prism-run ./shop-workspace --env CI                       # a workspace saved as a folder
 ```
 
-The only dependencies are Electron and electron-builder, both dev-only. The
-application itself is plain ES modules and Node built-ins — no framework, no
-bundler, no build step. `npm test` runs on a bare Node install, which is why
-CI needs nothing but `actions/setup-node`.
+Requests can carry **pre-request and test scripts** in JavaScript with
+Postman's `pm` object (`prism` is the same object), so Postman scripts run as
+they are. In the app they run in a worker with no network, no files and none
+of the app's controls, stopped after 5 seconds; on the command line each runs
+in a fresh VM context with the same limit.
+
+The application is plain ES modules and Node built-ins — no framework, no
+bundler, no build step. Its only runtime dependencies are `@grpc/grpc-js` and
+`@grpc/proto-loader`, for gRPC; js-yaml is vendored in `lib/vendor` for
+YAML OpenAPI documents. Electron and electron-builder are dev-only.
+
+## Beyond a single request
+
+- **Runner** — a collection or flow end to end, once per row of a CSV or JSON
+  data file, with reports (Prism HTML, JUnit, JSON). **Generate test data
+  from a schema** builds rows that probe input validation, each judged by
+  whether the API should accept or refuse it.
+- **Logic in a flow** — run a step only if, wait, repeat for each item, poll
+  until `json.status == "done"`, stop the flow on failure. Conditions are a
+  small language of their own, never run as code.
+- **OpenAPI contract** — a spec kept with its collection checks every
+  response (status, content type, schema, required headers); **Spec
+  coverage** shows which documented operations are exercised.
+- **Compare environments** — the same requests in Staging and Production,
+  graded Breaks / Differs / Same by contract, not by values.
+- **Mock server** — Prism answers at `127.0.0.1` from baselines, last
+  responses and spec examples, for front ends whose back end is not ready.
+- **Load test** — up to 50 users through a flow, with p50/p95/p99, errors and
+  a budget.
+- **Schedules** — a flow every few minutes against its own environment, with
+  a desktop notification on failure; every run lands on the **Run timeline**,
+  where any two runs can be compared.
+- **WebSocket, Server-Sent Events and gRPC** alongside HTTP.
+- **Console** — every request as it went out and came back, script logs and
+  errors, credentials masked.
+- **Workspaces as folders** — a file per request, for readable pull requests.
+- **AI assistant** — optional and off by default: explain a failure, suggest
+  checks; with your own key, or Ollama on this machine. You see everything it
+  is sent.
+
+`npm test` runs on a bare Node install, which is why CI needs nothing but
+`actions/setup-node` and `npm install`.
 
 ---
 
@@ -222,11 +263,18 @@ prism-run <workspace.json> [options]
 
   -e, --env <name>        environment to use, by name
   -f, --flow <name>       run only this flow
-  -r, --reporter <kind>   text | json | junit
+  -r, --reporter <kind>   text | json | junit | html
   -o, --out <path>        write the report to a file
+  -d, --data <file>       CSV or JSON: one iteration per row
+  -n, --iterations <n>    how many iterations to run
       --bail              stop at the first failure
       --insecure          do not verify TLS certificates
+      --no-spec           do not check responses against a collection's OpenAPI document
 ```
+
+The workspace may be a `.prism.json` file or a folder saved for Git. Scripts,
+step logic, gRPC requests and OpenAPI contract checks run as they do in the
+app.
 
 Exits 0 when every assertion passed and 1 otherwise, which is the only thing a
 CI runner reads. Chaining, cookies, datasets and assertions all behave exactly
@@ -363,8 +411,8 @@ assertion passed, what changed since last time, what lands in an exported file
 
 - **Recording.** Prism is an API testing tool, not a traffic recorder. A
   browser's network tab can export a HAR file, and Prism imports that.
-- **Postman pre-request scripts.** Read as text, not executed.
-- **Performance analytics across runs.** History holds a session; there is no
-  P95 or latency heatmap yet, because there is nothing durable to compute one
-  from.
+- **Attack tooling.** Prism tests the APIs you build and own; it does not
+  generate exploit payloads.
+- **Client and bidirectional gRPC streaming.** Unary calls and server
+  streaming are supported.
 - **Binary bodies.** Export the request to send one.

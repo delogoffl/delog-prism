@@ -11,6 +11,7 @@
     <header class="bar" id="bar">
       <div class="bar-drag"></div>
 
+      <div class="cap cap-left">
       <span class="logo" aria-hidden="true">
         <svg viewBox="0 0 28 28" width="24" height="24">
           <!-- One beam in, a spectrum out. The mark is the product: a
@@ -29,6 +30,7 @@
           <path d="M19.5 20.5 H27" stroke="var(--magenta)" stroke-width="1.3" stroke-linecap="round" />
         </svg>
       </span>
+      <b class="brand-word" aria-hidden="true">Prism</b>
 
       <!-- The workspace: its name, where you are in it, and its file menu. -->
       <button class="ws" id="wsBtn" type="button" aria-haspopup="menu" title="Workspace — save, open and more">
@@ -38,6 +40,7 @@
         </span>
         <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m7 10 5 5 5-5" /></svg>
       </button>
+      </div>
 
       <button class="finder" id="finder" type="button">
         <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></svg>
@@ -45,7 +48,7 @@
         <kbd><i>Ctrl</i><i>K</i></kbd>
       </button>
 
-      <div class="bar-right">
+      <div class="bar-right cap cap-right">
         <button class="env-pick" id="envPick" type="button">
           <span class="env-dot" id="envDot"></span>
           <span id="envLabel">No environment</span>
@@ -101,13 +104,22 @@
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11 12 4l8 7" /><path d="M6 9.5V20h12V9.5" /><path d="M10 20v-5h4v5" /></svg>
           <span class="rail-label">Overview</span>
         </button>
+        <button class="rail-btn" id="railRunner" type="button" data-label="Runner" aria-label="Runner">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10" /><path d="M4 12h7" /><path d="M4 18h10" /><path d="m16 10 5 3-5 3z" fill="currentColor" /></svg>
+          <span class="rail-label">Runner</span>
+        </button>
         <button class="rail-btn" id="envBtn" type="button" data-label="Environments" aria-label="Environments">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1" /><path d="M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1" /></svg>
-          <span class="rail-label">Envs</span>
+          <span class="rail-label">Environments</span>
         </button>
         <button class="rail-btn" id="historyBtn" type="button" data-label="History" aria-label="History">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
           <span class="rail-label">History</span>
+        </button>
+        <button class="rail-btn" id="consoleBtn" type="button" data-label="Console (Ctrl+`)" aria-label="Console" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m7 9 3 3-3 3" /><path d="M12 15h5" /></svg>
+          <span class="rail-label">Console</span>
+          <b class="rail-count" id="consoleCount" hidden></b>
         </button>
         <button class="rail-btn" id="railExport" type="button" data-label="Export" aria-label="Export">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14V3" /><path d="m7.5 7.5 4.5-4.5 4.5 4.5" /><path d="M4 20h16" /></svg>
@@ -121,6 +133,10 @@
         <button class="rail-btn" id="settingsBtn" type="button" data-label="Settings" aria-label="Settings">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.3a2 2 0 1 1-4 0v-.2a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 3.5 15H3a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.6 1.6 0 0 0 10 4.5V4a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.3a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.3 1z" /></svg>
           <span class="rail-label">Settings</span>
+        </button>
+        <button class="rail-btn rail-fold" id="railFold" type="button" data-label="Expand the sidebar (Ctrl+B)" aria-label="Expand the sidebar" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M9 4v16" /><path d="m13 10 2 2-2 2" /></svg>
+          <span class="rail-label">Collapse</span>
         </button>
       </nav>
 
@@ -152,7 +168,13 @@
             <button id="zoomOut" type="button" aria-label="Zoom out">−</button>
             <span id="zoomPct">100%</span>
             <button id="zoomIn" type="button" aria-label="Zoom in">+</button>
-            <span class="zdiv"></span>
+          </div>
+          <!-- The canvas's own primary action: big, round and lit. -->
+          <button class="plane-run" id="planeRun" type="button" title="Run the flow along the graph" hidden>
+            <span class="plane-run-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" stroke="none"><path d="M7 4v16l13-8z" /></svg></span>
+            <span>Run flow</span>
+          </button>
+          <div class="zoomer">
             <button id="zoomFit" type="button">Fit</button>
             <button id="tidyBtn" type="button" title="Lay the nodes back out in order">Tidy</button>
           </div>
@@ -202,6 +224,8 @@
 
       <!-- ======================================================= workbench -->
       <aside class="bench" aria-label="Workbench">
+        <span class="bench-caret" id="benchCaret" data-side="none" aria-hidden="true"></span>
+        <div class="bench-edge" id="benchEdge" role="separator" aria-orientation="vertical" aria-label="Resize the inspector — double-click to maximise" tabindex="0"></div>
         <div class="bench-none" id="benchNone">
           <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 12h4l3-7 4 14 3-7h4" /></svg>
           <p>Pick a request to inspect it</p>
@@ -209,19 +233,27 @@
         </div>
 
         <div class="bench-live" id="benchLive" hidden>
+          <!-- Which line the stop is on, and where along it. -->
+          <div class="bench-line"><span class="line-key" aria-hidden="true"></span><span id="benchLineText"></span></div>
           <div class="bench-head">
             <span class="verb" id="benchVerb">GET</span>
             <input class="bench-name" id="benchName" aria-label="Request name" />
+            <button class="mini-btn" id="benchMax" type="button" title="Maximise (Ctrl+Shift+M)" aria-label="Maximise the inspector" aria-pressed="false">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6" /><path d="M9 21H3v-6" /><path d="M21 3l-7 7" /><path d="M3 21l7-7" /></svg>
+            </button>
             <button class="mini-btn" id="benchMore" type="button" title="Actions" aria-label="Actions for this request" aria-haspopup="menu">
               <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="5" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="12" cy="19" r="1.6" /></svg>
+            </button>
+            <button class="mini-btn" id="benchClose" type="button" title="Close (Esc)" aria-label="Close the inspector">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
             </button>
           </div>
 
           <div class="addr">
-            <div class="addr-verb" id="addrVerb">
+            <button class="addr-verb" id="addrVerb" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Method">
               <span id="addrVerbText">GET</span>
-              <select id="methodPick" aria-label="Method"></select>
-            </div>
+              <svg class="addr-verb-chev" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+            </button>
             <input class="addr-url" id="urlInput" spellcheck="false" placeholder="{{base_url}}/api/…" aria-label="Endpoint" />
             <button class="addr-go" id="sendBtn" type="button">
               <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" stroke="none"><path d="M7 4v16l13-8z" /></svg>
@@ -283,11 +315,14 @@
       <section class="view" id="view" hidden aria-live="polite"></section>
     </main>
 
+    <section class="cn" id="consoleDrawer" aria-label="Console" hidden></section>
+
     <!-- ========================================================== status -->
     <footer class="status" id="status" aria-label="Status">
       <span class="status-item" id="statusSave"><i class="status-dot"></i><span>Kept in the app</span></span>
       <span class="status-item" id="statusCounts"></span>
       <span class="status-gap"></span>
+      <button class="status-item status-mock" id="statusMock" type="button" hidden title="The mock server is answering — open it"></button>
       <span class="status-item" id="statusEnv"></span>
       <span class="status-item"><kbd>Ctrl K</kbd> commands</span>
     </footer>

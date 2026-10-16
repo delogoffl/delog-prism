@@ -8,8 +8,8 @@
  * is one of the handlers below. That is the whole security model: if it is not
  * in this file, the page cannot do it.
  */
-const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, screen, shell } = require('electron')
-const { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync } = require('node:fs')
+const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, screen, shell, safeStorage } = require('electron')
+const { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync, readdirSync, statSync } = require('node:fs')
 // Electron already exports a `net`; this is the socket one.
 const sockets = require('node:net')
 const tls = require('node:tls')
@@ -98,6 +98,8 @@ function createWindow() {
     titleBarStyle: 'hidden',
     trafficLightPosition: { x: 18, y: 20 },
     webPreferences: {
+      // Scheduled runs keep their times while the window is minimised.
+      backgroundThrottling: false,
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
@@ -151,6 +153,7 @@ let closing = false
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
@@ -201,6 +204,8 @@ function lastFile() {
     // neither is one that is not a workspace. Older builds remembered imported
     // collections and datasets here, and handing one back made Save overwrite it.
     if (!path || !existsSync(path)) return ''
+    // A workspace kept as a folder is remembered by its folder.
+    if (statSync(path).isDirectory()) return existsSync(join(path, 'prism.workspace.json')) ? path : ''
     return isWorkspaceText(readFileSync(path, 'utf8')) ? path : ''
   } catch {
     return ''
@@ -214,7 +219,33 @@ function writeAtomic(path, text) {
   renameSync(tmp, path)
 }
 
+/**
+ * One Prism at a time.
+ *
+ * A second launch used to start a rival copy that fought the first for the
+ * same cache and the same autosave file -- the cache half of that is the
+ * "Unable to move the cache: Access is denied" noise in the terminal. Now a
+ * second launch hands over to the first: its window comes forward, or one is
+ * opened if it has none, and the newcomer quits.
+ */
+const primary = app.requestSingleInstanceLock()
+if (!primary) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (!app.isReady()) return
+    if (!win) {
+      createWindow()
+      return
+    }
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  })
+}
+
 app.whenReady().then(() => {
+  if (!primary) return
   protocol.handle('prism', (request) => {
     const path = new URL(request.url).pathname
     // Resolved inside the renderer directory and checked afterwards, so a
@@ -228,7 +259,11 @@ app.whenReady().then(() => {
           // Read from disk every time. Without this Chromium caches the
           // modules and a reload quietly serves the previous build — which
           // looks exactly like a change that did not work.
-          'cache-control': 'no-store'
+          'cache-control': 'no-store',
+          // The script worker's own policy: its code and the app's modules,
+          // the eval that runs a script, and nothing else — no network at
+          // all, and no code from anywhere outside the app.
+          ...(file.endsWith('script-worker.js') ? { 'content-security-policy': "default-src 'none'; script-src 'self' 'unsafe-eval'" } : {})
         }
       })
     } catch {
@@ -386,6 +421,352 @@ ipcMain.handle('workspace:restore', () => {
 
 // Deleted, not blanked. Settings offers this as "Forget", and leaving a
 // zero-byte file behind would have the row still reporting a saved workspace.
+/* ----------------------------------------------------------------- backups */
+
+/**
+ * Automatic backups, kept in their own folder beside the autosave.
+ *
+ * Only files this code named can be touched: every call that takes a name
+ * checks it against the one pattern backups are written under, so a crafted
+ * name cannot reach outside the folder. The newest thirty are kept.
+ */
+const backupDir = () => join(app.getPath('userData'), 'backups')
+const BACKUP_NAME = /^[\w-]+\.prism-backup\.json$/
+const BACKUPS_KEPT = 30
+
+function backupNames() {
+  if (!existsSync(backupDir())) return []
+  return readdirSync(backupDir())
+    .filter((name) => BACKUP_NAME.test(name))
+    .sort()
+}
+
+ipcMain.handle('backup:keep', (_e, { name, text, fingerprint, skipIfSame }) => {
+  if (!BACKUP_NAME.test(String(name))) return { ok: false, error: 'That is not a backup name.' }
+  try {
+    mkdirSync(backupDir(), { recursive: true })
+    const names = backupNames()
+    // Nothing changed since the last one: an hourly backup of an untouched
+    // workspace would only push a useful older one out of the thirty.
+    const latest = names[names.length - 1]
+    if (skipIfSame && fingerprint && latest) {
+      try {
+        if (JSON.parse(readFileSync(join(backupDir(), latest), 'utf8')).fingerprint === fingerprint) return { ok: true, skipped: true }
+      } catch {
+        /* an unreadable latest is no reason not to write a new one */
+      }
+    }
+    writeAtomic(join(backupDir(), name), String(text))
+    for (const old of backupNames().reverse().slice(BACKUPS_KEPT)) rmSync(join(backupDir(), old), { force: true })
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('backup:list', () => {
+  const out = []
+  for (const name of backupNames().reverse()) {
+    try {
+      const path = join(backupDir(), name)
+      const doc = JSON.parse(readFileSync(path, 'utf8'))
+      out.push({ id: name, createdAt: doc.createdAt ?? '', reason: doc.reason ?? '', summary: doc.summary ?? null, bytes: statSync(path).size })
+    } catch {
+      // A damaged file is listed as such rather than hidden: it is still
+      // something on disk the user may want to delete.
+      out.push({ id: name, createdAt: '', reason: '', summary: null, bytes: 0, damaged: true })
+    }
+  }
+  return out
+})
+
+ipcMain.handle('backup:read', (_e, name) => {
+  if (!BACKUP_NAME.test(String(name))) return { error: 'That is not a backup name.' }
+  try {
+    return { name, text: readFileSync(join(backupDir(), name), 'utf8') }
+  } catch (err) {
+    return { error: err.message }
+  }
+})
+
+ipcMain.handle('backup:remove', (_e, name) => {
+  if (!BACKUP_NAME.test(String(name))) return false
+  try {
+    rmSync(join(backupDir(), name), { force: true })
+    return true
+  } catch {
+    return false
+  }
+})
+
+/* ------------------------------------------------------------ mock server
+
+   Answers in the API's place, on this machine only: bound to 127.0.0.1, so
+   nothing else on the network can reach it. What to answer is decided by
+   lib/mock.js from routes the window sends; this is only the socket. */
+
+let mock = null
+const mockLib = import('./lib/mock.js')
+
+function cleanRoutes(routes) {
+  return (Array.isArray(routes) ? routes : []).slice(0, 2000).map((r) => ({
+    ...r,
+    status: Number.isInteger(r?.status) && r.status >= 100 && r.status <= 599 ? r.status : 500,
+    headers: Object.fromEntries(Object.entries(r?.headers ?? {}).filter(([k, v]) => /^[\w!#$%&'*+.^`|~-]+$/.test(k) && !/[\r\n]/.test(String(v)))),
+    body: String(r?.body ?? '')
+  }))
+}
+
+function mockSettings(state, { routes, latency, cors }) {
+  if (routes !== undefined) state.routes = cleanRoutes(routes)
+  if (latency !== undefined) state.latency = Math.max(0, Math.min(30000, Number(latency) || 0))
+  if (cors !== undefined) state.cors = cors !== false
+}
+
+function stopMock() {
+  return new Promise((resolve) => {
+    if (!mock) return resolve({ ok: true })
+    const { server } = mock
+    mock = null
+    server.close(() => resolve({ ok: true }))
+    server.closeAllConnections?.()
+  })
+}
+
+/* ------------------------------------------- WebSocket and Server-Sent Events
+
+   A live connection the window drives: opened here, where Node can set
+   headers and reach any host, and every frame sent back as it happens. */
+
+const streams = new Map()
+const sseLib = import('./lib/sse.js')
+const streamEmit = (id, type, extra = {}) => win?.webContents.send('stream:event', { id, type, at: Date.now(), ...extra })
+const cleanHeaders = (headers) => Object.fromEntries(Object.entries(headers ?? {}).filter(([k, v]) => /^[\w!#$%&'*+.^`|~-]+$/.test(k) && !/[\r\n]/.test(String(v))).map(([k, v]) => [k, String(v)]))
+
+ipcMain.handle('stream:open', async (_e, { id, kind, url, headers, protocols, verifyTls } = {}) => {
+  const key = String(id ?? '')
+  if (!key) return { ok: false, error: 'No connection id' }
+  streams.get(key)?.close()
+  let u
+  try {
+    u = new URL(String(url ?? ''))
+  } catch {
+    return { ok: false, error: 'That is not a full address — it needs ws://, wss://, http:// or https://' }
+  }
+  if (kind === 'ws') {
+    if (u.protocol === 'http:') u.protocol = 'ws:'
+    if (u.protocol === 'https:') u.protocol = 'wss:'
+    if (!/^wss?:$/.test(u.protocol)) return { ok: false, error: 'A WebSocket address starts with ws:// or wss://' }
+    let ws
+    try {
+      ws = new WebSocket(u.href, { headers: cleanHeaders(headers), protocols: (Array.isArray(protocols) ? protocols : []).map(String).filter(Boolean) })
+    } catch (err) {
+      return { ok: false, error: err.message }
+    }
+    streams.set(key, { close: (code = 1000) => ws.close(code), send: (data) => ws.send(data) })
+    ws.onopen = () => streamEmit(key, 'open', { url: u.href, protocol: ws.protocol })
+    ws.onmessage = (ev) => streamEmit(key, 'message', { data: typeof ev.data === 'string' ? ev.data : `[binary, ${ev.data?.byteLength ?? ev.data?.size ?? 0} bytes]` })
+    ws.onerror = (ev) => streamEmit(key, 'error', { data: ev?.message || ev?.error?.message || 'The connection failed' })
+    ws.onclose = (ev) => {
+      streams.delete(key)
+      streamEmit(key, 'close', { code: ev.code, reason: ev.reason })
+    }
+    return { ok: true, url: u.href }
+  }
+  if (kind === 'sse') {
+    if (!/^https?:$/.test(u.protocol)) return { ok: false, error: 'An event stream address starts with http:// or https://' }
+    const lib = await sseLib
+    const mod = u.protocol === 'https:' ? https : http
+    let closed = false
+    const finish = (extra) => {
+      if (closed) return
+      closed = true
+      streams.delete(key)
+      streamEmit(key, 'close', extra)
+    }
+    const req = mod.request(u, { method: 'GET', headers: { accept: 'text/event-stream', 'cache-control': 'no-cache', ...cleanHeaders(headers) }, rejectUnauthorized: verifyTls !== false }, (res) => {
+      streamEmit(key, 'open', { url: u.href, status: res.statusCode, type: String(res.headers['content-type'] ?? '') })
+      res.setEncoding('utf8')
+      if ((res.statusCode ?? 0) >= 400) {
+        let text = ''
+        res.on('data', (c) => (text = (text + c).slice(0, 4000)))
+        res.on('end', () => {
+          streamEmit(key, 'error', { data: `${res.statusCode} ${res.statusMessage ?? ''} ${text}`.trim() })
+          finish({ code: res.statusCode })
+        })
+        return
+      }
+      const parser = lib.sseParser((ev) => streamEmit(key, 'message', { event: ev.event, data: ev.data, lastId: ev.id }))
+      res.on('data', (c) => parser.feed(c))
+      res.on('end', () => {
+        parser.end()
+        finish({ reason: 'The server ended the stream' })
+      })
+    })
+    req.on('error', (err) => {
+      if (!closed) streamEmit(key, 'error', { data: err.message })
+      finish({})
+    })
+    req.end()
+    streams.set(key, {
+      close: () => {
+        req.destroy()
+        finish({ reason: 'Closed by you' })
+      }
+    })
+    return { ok: true, url: u.href }
+  }
+  return { ok: false, error: 'Unknown kind of connection' }
+})
+
+/* --------------------------------------------------------- AI assistant
+
+   The key is kept by the operating system's encrypted store and used here;
+   the window can set it, clear it and ask whether there is one, never read
+   it back. The question itself is built — and shown — by the window. */
+
+const aiLib = import('./lib/ai.js')
+const aiKeyPath = () => join(app.getPath('userData'), 'ai-key.bin')
+
+ipcMain.handle('ai:hasKey', () => existsSync(aiKeyPath()))
+ipcMain.handle('ai:setKey', (_e, key) => {
+  const text = String(key ?? '').trim()
+  if (!text) return { ok: false, error: 'No key' }
+  if (!safeStorage.isEncryptionAvailable()) return { ok: false, error: 'This system offers no encrypted store, so the key is not kept' }
+  try {
+    writeFileSync(aiKeyPath(), safeStorage.encryptString(text))
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+ipcMain.handle('ai:clearKey', () => {
+  rmSync(aiKeyPath(), { force: true })
+  return { ok: true }
+})
+ipcMain.handle('ai:ask', async (_e, { provider, model, baseUrl, system, prompt } = {}) => {
+  const lib = await aiLib
+  let key = ''
+  if (lib.PROVIDERS[provider]?.needsKey && existsSync(aiKeyPath())) {
+    try {
+      key = safeStorage.decryptString(readFileSync(aiKeyPath()))
+    } catch {
+      return { ok: false, error: 'The saved key could not be read — add it again' }
+    }
+  }
+  let request
+  try {
+    request = lib.providerRequest({ provider, model, baseUrl, key, system: String(system ?? ''), prompt: String(prompt ?? '') })
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+  try {
+    const res = await fetch(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(request.body), signal: AbortSignal.timeout(120000) })
+    let json = {}
+    try {
+      json = await res.json()
+    } catch {
+      /* not JSON: said below */
+    }
+    return lib.readReply(provider, res.status, json)
+  } catch (err) {
+    return { ok: false, error: provider === 'ollama' ? `Ollama is not answering at ${request.url} — is it running?` : err.message }
+  }
+})
+
+/* ------------------------------------------------------------------ gRPC */
+
+const grpcLib = import('./lib/grpc.js')
+ipcMain.handle('grpc:describe', async (_e, { proto, name } = {}) => (await grpcLib).describeProto(String(proto ?? ''), String(name ?? 'request.proto')))
+ipcMain.handle('grpc:call', async (_e, payload = {}) => {
+  try {
+    return await (await grpcLib).callGrpc(payload)
+  } catch (err) {
+    return { error: err.message }
+  }
+})
+
+ipcMain.handle('stream:send', (_e, { id, data } = {}) => {
+  const s = streams.get(String(id ?? ''))
+  if (!s?.send) return { ok: false, error: 'Not connected' }
+  try {
+    s.send(String(data ?? ''))
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('stream:close', (_e, id) => {
+  streams.get(String(id ?? ''))?.close()
+  return { ok: true }
+})
+
+app.on('before-quit', () => {
+  for (const s of streams.values()) s.close()
+})
+
+ipcMain.handle('mock:start', async (_e, options = {}) => {
+  const lib = await mockLib
+  await stopMock()
+  const port = Number(options.port)
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) return { ok: false, error: 'Choose a port between 1024 and 65535.' }
+  const state = { routes: [], latency: 0, cors: true }
+  mockSettings(state, options)
+  const server = http.createServer((req, res) => {
+    const started = Date.now()
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > 10 * 1024 * 1024) req.destroy()
+    })
+    req.on('end', () => {
+      const out = lib.answer(state.routes, { method: req.method, url: req.url, cors: state.cors, origin: req.headers.origin })
+      setTimeout(() => {
+        try {
+          res.writeHead(out.status, out.headers)
+          res.end(out.body)
+        } catch (err) {
+          res.writeHead(500, { 'content-type': 'text/plain' })
+          res.end(`Prism mock could not answer: ${err.message}`)
+        }
+        win?.webContents.send('mock:hit', {
+          at: started,
+          method: req.method,
+          path: req.url,
+          status: out.status,
+          route: out.route ? `${out.route.method} ${out.route.path}` : '',
+          name: out.route?.name ?? '',
+          source: out.route?.source ?? 'none',
+          ms: Date.now() - started
+        })
+      }, state.latency)
+    })
+  })
+  return new Promise((resolve) => {
+    server.once('error', (err) => resolve({ ok: false, error: err.code === 'EADDRINUSE' ? `Port ${port} is already in use — choose another.` : err.message }))
+    server.listen(port, '127.0.0.1', () => {
+      mock = { server, port, state }
+      resolve({ ok: true, port })
+    })
+  })
+})
+
+ipcMain.handle('mock:update', (_e, options = {}) => {
+  if (!mock) return { ok: false }
+  mockSettings(mock.state, options)
+  return { ok: true }
+})
+
+ipcMain.handle('mock:stop', () => stopMock())
+ipcMain.handle('mock:status', () => (mock ? { running: true, port: mock.port } : { running: false }))
+app.on('before-quit', () => void stopMock())
+
+ipcMain.handle('backup:reveal', () => {
+  mkdirSync(backupDir(), { recursive: true })
+  return shell.openPath(backupDir())
+})
+
 ipcMain.handle('workspace:forget', () => {
   try {
     if (existsSync(autosavePath())) rmSync(autosavePath())
@@ -429,6 +810,69 @@ ipcMain.handle('workspace:open', async () => {
   return { path, name: basename(path), text, workspace: true }
 })
 
+/* ------------------------------------------------- a workspace as a folder
+
+   lib/folder.js says which files a workspace is; this reads and writes them.
+   Only files that format owns are ever written or removed, so a README, a
+   .git folder or anything else beside them is left alone. */
+
+const folderIo = import('./lib/folder-io.js')
+const isFolder = (path) => {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+const folderText = async (dir) => (await folderIo).folderText(dir)
+const writeFolder = async (dir, text) => (await folderIo).writeFolder(dir, text)
+
+ipcMain.handle('workspace:saveAsFolder', async (_e, { name, text }) => {
+  if (!win) return null
+  const res = await dialog.showOpenDialog(win, {
+    title: 'Choose where to keep the workspace folder',
+    buttonLabel: 'Save here',
+    defaultPath: app.getPath('documents'),
+    properties: ['openDirectory', 'createDirectory']
+  })
+  if (res.canceled || !res.filePaths[0]) return null
+  let dir = res.filePaths[0]
+  // An empty folder, or one that already holds this format, is used as it is;
+  // anywhere else gets a folder of its own, named after the workspace.
+  const entries = readdirSync(dir)
+  if (entries.length && !entries.includes('prism.workspace.json')) {
+    dir = join(dir, String(name || 'workspace').replace(/[^\w.-]+/g, '-') || 'workspace')
+    if (existsSync(dir) && readdirSync(dir).length && !existsSync(join(dir, 'prism.workspace.json'))) {
+      return { error: `${basename(dir)} already exists and is not a Prism workspace folder — choose an empty folder.` }
+    }
+  }
+  try {
+    mkdirSync(dir, { recursive: true })
+    await writeFolder(dir, text)
+  } catch (err) {
+    return { error: err.message }
+  }
+  chosenPaths.add(dir)
+  rememberFile(dir)
+  return { path: dir }
+})
+
+ipcMain.handle('workspace:openFolder', async () => {
+  if (!win) return null
+  const res = await dialog.showOpenDialog(win, { title: 'Open a workspace folder', properties: ['openDirectory'] })
+  if (res.canceled || !res.filePaths[0]) return null
+  const dir = res.filePaths[0]
+  if (!existsSync(join(dir, 'prism.workspace.json'))) return { error: `${basename(dir)} is not a Prism workspace folder — it has no prism.workspace.json.` }
+  try {
+    const text = await folderText(dir)
+    chosenPaths.add(dir)
+    rememberFile(dir)
+    return { path: dir, name: basename(dir), text, workspace: true }
+  } catch (err) {
+    return { error: `Cannot read ${basename(dir)} — ${err.message}` }
+  }
+})
+
 /** Whether some text is a Prism workspace, without trusting anything else in it. */
 function isWorkspaceText(text) {
   try {
@@ -466,13 +910,14 @@ ipcMain.handle('workspace:saveAs', async (_e, { name, text }) => {
  * Atomic, like the autosave: the file people are about to commit is the worst
  * possible thing to leave half-written.
  */
-ipcMain.handle('workspace:write', (_e, { path, text }) => {
+ipcMain.handle('workspace:write', async (_e, { path, text }) => {
   const target = String(path ?? '')
   if (!chosenPaths.has(target)) {
     return { error: 'That file was not opened or saved in this session — use Save as instead.' }
   }
   try {
-    writeAtomic(target, String(text))
+    if (isFolder(target)) await writeFolder(target, text)
+    else writeAtomic(target, String(text))
     return { ok: true, path: target }
   } catch (err) {
     return { error: err.message }
@@ -483,7 +928,8 @@ ipcMain.handle('workspace:write', (_e, { path, text }) => {
 ipcMain.handle('workspace:reveal', (_e, path) => {
   const target = String(path ?? '')
   if (!chosenPaths.has(target) || !existsSync(target)) return false
-  shell.showItemInFolder(target)
+  if (isFolder(target)) shell.openPath(target)
+  else shell.showItemInFolder(target)
   return true
 })
 
@@ -492,11 +938,11 @@ ipcMain.handle('workspace:reveal', (_e, path) => {
  *
  * Same gate as writing: only somewhere they pointed a dialog.
  */
-ipcMain.handle('workspace:reread', (_e, path) => {
+ipcMain.handle('workspace:reread', async (_e, path) => {
   const target = String(path ?? '')
   if (!chosenPaths.has(target)) return null
   try {
-    return { path: target, name: basename(target), text: readFileSync(target, 'utf8') }
+    return { path: target, name: basename(target), text: isFolder(target) ? await folderText(target) : readFileSync(target, 'utf8') }
   } catch (err) {
     return { error: err.message }
   }

@@ -38,6 +38,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --devtools",
+    "icon": "electron scripts/make-icon.cjs",
     "test": "node --test \"test/*.test.mjs\"",
     "dist": "electron-builder",
     "dist:dir": "electron-builder --dir",
@@ -102,5 +103,9 @@
   },
   "bin": {
     "prism-run": "./cli.mjs"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.6",
+    "@grpc/proto-loader": "^0.8.1"
   }
 }
